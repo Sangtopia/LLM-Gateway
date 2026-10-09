@@ -12,6 +12,7 @@ import os
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 
 import httpx
@@ -73,7 +74,12 @@ def main() -> None:
     gateway = start(
         "gateway.main:app",
         GATEWAY_PORT,
-        env={"ANTHROPIC_BASE_URL": f"http://127.0.0.1:{FAKE_PORT}", "ANTHROPIC_API_KEY": "fake"},
+        env={
+            "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{FAKE_PORT}",
+            "ANTHROPIC_API_KEY": "fake",
+            # Keep benchmark traffic out of the real request log.
+            "DATABASE_URL": f"sqlite+aiosqlite:///{tempfile.mkdtemp()}/bench.db",
+        },
     )
     direct = f"http://127.0.0.1:{FAKE_PORT}/v1/messages"
     via_gateway = f"http://127.0.0.1:{GATEWAY_PORT}/v1/messages"

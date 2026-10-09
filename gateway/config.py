@@ -6,6 +6,7 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = ""
     anthropic_base_url: str = "https://api.anthropic.com"
+    database_url: str = "sqlite+aiosqlite:///./gateway.db"
 
 
 settings = Settings()
