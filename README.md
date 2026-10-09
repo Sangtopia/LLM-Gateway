@@ -1,2 +1,2 @@
 # LLM-Gateway
-an Anthropic’s API format LLM gateway with multi-provider routing, fallback chains, circuit breakers, caching, and per-key rate limits and budgets.
+An LLM gateway that speaks the Anthropic Messages API, with routing across Claude models, fallback chains, circuit breakers, caching, and per-key rate limits and budgets.
