@@ -47,3 +47,52 @@ def test_passes_through_upstream_errors():
 
     assert resp.status_code == 429
     assert resp.headers["retry-after"] == "7"
+
+
+SSE_EVENTS = [
+    b'event: message_start\ndata: {"type":"message_start"}\n\n',
+    b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}\n\n',
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+]
+
+
+def test_streams_sse_through_unchanged():
+    async def events():
+        for event in SSE_EVENTS:
+            yield event
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=events(), headers={"content-type": "text/event-stream"})
+
+    with make_client(handler).stream("POST", "/v1/messages", json={"stream": True}) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        assert resp.read() == b"".join(SSE_EVENTS)
+
+
+def test_stream_request_that_errors_returns_json_error():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(529, json={"type": "error", "error": {"type": "overloaded_error"}})
+
+    resp = make_client(handler).post("/v1/messages", json={"stream": True})
+
+    assert resp.status_code == 529
+    assert resp.json()["error"]["type"] == "overloaded_error"
+
+
+def test_stream_asks_upstream_not_to_compress_and_decodes_if_it_does():
+    import gzip
+
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["accept-encoding"] = req.headers.get("accept-encoding")
+        return httpx.Response(
+            200,
+            content=gzip.compress(b"".join(SSE_EVENTS)),
+            headers={"content-type": "text/event-stream", "content-encoding": "gzip"},
+        )
+
+    with make_client(handler).stream("POST", "/v1/messages", json={"stream": True}) as resp:
+        assert resp.read() == b"".join(SSE_EVENTS)
+    assert seen["accept-encoding"] == "identity"
