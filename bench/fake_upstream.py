@@ -8,6 +8,10 @@ It can also misbehave on command, for testing retries and fallbacks:
     POST /_control {"delay_ms": 2000}                 wait before answering
     POST /_control {"fail_models": ["claude-sonnet-5-5"], "status": 529}
                                                       that model always fails (others work)
+    POST /_control {"stream_fail": "error_before_content", "stream_fail_next": 1}
+                                                      next stream sends an overloaded error before any text
+    POST /_control {"stream_fail": "cut_after_content", "stream_fail_next": 1}
+                                                      next stream drops the connection after some text
     POST /_control {}                                 back to normal
     GET  /_control                                    current settings and request count
 """
@@ -34,7 +38,15 @@ MESSAGE = {
 
 ERROR_TYPES = {429: "rate_limit_error", 500: "api_error", 503: "api_error", 529: "overloaded_error"}
 
-DEFAULTS = {"fail_next": 0, "fail_rate": 0.0, "status": 529, "delay_ms": 0, "fail_models": []}
+DEFAULTS = {
+    "fail_next": 0,
+    "fail_rate": 0.0,
+    "status": 529,
+    "delay_ms": 0,
+    "fail_models": [],
+    "stream_fail": None,
+    "stream_fail_next": 0,
+}
 state = {**DEFAULTS, "requests": 0}
 
 
@@ -88,8 +100,22 @@ async def messages(request: Request) -> Response:
 
     model = body.get("model", MESSAGE["model"])
     if body.get("stream"):
+        stream_fail = None
+        if state["stream_fail"] and state["stream_fail_next"] > 0:
+            state["stream_fail_next"] -= 1
+            stream_fail = state["stream_fail"]
+
         async def events():
-            for event in stream_events(model):
+            all_events = stream_events(model)
+            if stream_fail == "error_before_content":
+                yield all_events[0]
+                yield sse({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+                return
+            for i, event in enumerate(all_events):
+                if stream_fail == "cut_after_content" and i == 4:  # After two text deltas.
+                    raise ConnectionResetError("injected disconnect")
                 yield event
+                await asyncio.sleep(0)
+
         return StreamingResponse(events(), media_type="text/event-stream")
     return Response(json.dumps({**MESSAGE, "model": model}), media_type="application/json", headers={"request-id": "req_fake"})

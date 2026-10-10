@@ -483,3 +483,119 @@ def test_client_errors_do_not_trip_the_breaker():
     for _ in range(5):
         client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
     assert app.state.breaker.state("claude-sonnet-5-5") == "closed"
+
+
+# --- Streams that fail partway through ---------------------------------------
+
+OVERLOADED_EVENT = sse({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})
+
+
+def scripted_streams(*scripts):
+    """Upstream that plays one script per call. A script is a list of SSE chunks;
+    an exception in it is raised at that point, like a dropped connection."""
+    calls: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        model = json.loads(req.content)["model"]
+        script = scripts[len(calls)]
+        calls.append(model)
+
+        async def body():
+            for item in script:
+                if isinstance(item, Exception):
+                    raise item
+                yield item.replace(b"claude-sonnet-5-5", model.encode())
+
+        return httpx.Response(200, content=body(), headers={"content-type": "text/event-stream"})
+
+    return handler, calls
+
+
+def stream_request(client, model="claude-sonnet-5-5"):
+    with client.stream("POST", "/v1/messages", json={"model": model, "stream": True}) as resp:
+        return resp.status_code, resp.read()
+
+
+def events_in(body: bytes) -> list[dict]:
+    return [json.loads(line[6:]) for line in body.decode().splitlines() if line.startswith("data: ")]
+
+
+def test_error_before_content_is_recovered_on_the_next_model_without_the_app_noticing():
+    handler, calls = scripted_streams([SSE_EVENTS[0], OVERLOADED_EVENT], SSE_EVENTS)
+    client, log = make_client(handler)
+    status, body = stream_request(client)
+
+    assert status == 200
+    assert [e["type"] for e in events_in(body)] == ["message_start", "content_block_delta", "message_delta", "message_stop"]
+    assert events_in(body)[0]["message"]["model"] == "claude-sonnet-5"  # Only the second stream reached the app.
+    assert calls == ["claude-sonnet-5-5", "claude-sonnet-5"]
+    [record] = log.records
+    assert record["outcome"] == "ok"
+    assert record["served_model"] == "claude-sonnet-5" and record["fallback_used"] is True
+    assert record["attempts"][1] == {"model": "claude-sonnet-5-5", "error": "stream:overloaded_error", "ms": 0.0}
+
+
+def test_connection_lost_before_content_is_recovered():
+    handler, calls = scripted_streams([SSE_EVENTS[0], httpx.ReadError("reset")], SSE_EVENTS)
+    client, log = make_client(handler)
+    status, body = stream_request(client)
+
+    assert [e["type"] for e in events_in(body)][-1] == "message_stop"
+    assert log.records[0]["outcome"] == "ok"
+
+
+def test_model_without_fallback_is_retried_after_a_failed_stream():
+    handler, calls = scripted_streams([SSE_EVENTS[0], OVERLOADED_EVENT], SSE_EVENTS)
+    client, log = make_client(handler)
+    status, body = stream_request(client, model="claude-haiku-5-5")
+
+    assert calls == ["claude-haiku-5-5", "claude-haiku-5-5"]
+    assert log.records[0]["outcome"] == "ok"
+
+
+def test_gives_up_after_max_recoveries_and_passes_upstream_error_on():
+    failing = [SSE_EVENTS[0], OVERLOADED_EVENT]
+    handler, calls = scripted_streams(failing, failing, failing)
+    client, log = make_client(handler)
+    status, body = stream_request(client)
+
+    assert status == 200
+    assert [e["type"] for e in events_in(body)] == ["message_start", "error"]
+    assert events_in(body)[-1]["error"]["type"] == "overloaded_error"
+    assert len(calls) == 3  # The original stream plus 2 recoveries.
+    assert log.records[0]["outcome"] == "error"
+    assert log.records[0]["error_type"] == "overloaded_error"
+
+
+def test_connection_lost_after_content_ends_stream_with_error_event():
+    handler, calls = scripted_streams([SSE_EVENTS[0], SSE_EVENTS[1], httpx.ReadError("reset")])
+    client, log = make_client(handler)
+    app.state.breaker = CircuitBreaker(failure_threshold=1)
+    status, body = stream_request(client)
+
+    events = events_in(body)
+    assert [e["type"] for e in events] == ["message_start", "content_block_delta", "error"]
+    assert events[-1]["error"]["type"] == "api_error"
+    assert calls == ["claude-sonnet-5-5"]  # No restart once content went out.
+    [record] = log.records
+    assert record["outcome"] == "error"
+    assert record["error_type"] == "upstream_stream_interrupted"
+    assert record["ttft_ms"] is not None
+    assert app.state.breaker.state("claude-sonnet-5-5") == "open"  # Counted against the model.
+
+
+def test_stall_after_content_ends_stream_with_timeout_event():
+    handler, _ = scripted_streams([SSE_EVENTS[0], SSE_EVENTS[1], httpx.ReadTimeout("idle")])
+    client, log = make_client(handler)
+    status, body = stream_request(client)
+
+    assert events_in(body)[-1]["error"]["type"] == "timeout_error"
+    assert log.records[0]["error_type"] == "upstream_timeout"
+
+
+def test_opening_events_are_held_until_first_content():
+    handler, _ = scripted_streams(SSE_EVENTS)
+    client, log = make_client(handler)
+    status, body = stream_request(client)
+
+    assert body == b"".join(SSE_EVENTS)  # Nothing lost or reordered by holding.

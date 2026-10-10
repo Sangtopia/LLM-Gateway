@@ -1,6 +1,7 @@
 import json
 import time
 import uuid
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import httpx
@@ -24,6 +25,9 @@ FORWARD_REQUEST_HEADERS = ("anthropic-version", "anthropic-beta", "content-type"
 
 # Upstream headers passed back to the client.
 FORWARD_RESPONSE_PREFIXES = ("anthropic-", "retry-after", "request-id", "content-type")
+
+# How many times a stream that fails before sending any content is transparently restarted.
+MAX_STREAM_RECOVERIES = 2
 
 
 def upstream_headers(request: Request) -> dict[str, str]:
@@ -64,9 +68,18 @@ def add_usage(record: dict, model: str | None, usage: dict) -> None:
     )
 
 
-def error_response(status: int, error_type: str, message: str) -> JSONResponse:
+def error_body(error_type: str, message: str) -> dict:
     # Same shape as Anthropic's own errors, so SDKs parse it normally.
-    return JSONResponse({"type": "error", "error": {"type": error_type, "message": message}}, status_code=status)
+    return {"type": "error", "error": {"type": error_type, "message": message}}
+
+
+def error_response(status: int, error_type: str, message: str) -> JSONResponse:
+    return JSONResponse(error_body(error_type, message), status_code=status)
+
+
+def sse_error(error_type: str, message: str) -> bytes:
+    """An `error` event, the way Anthropic reports failures inside a stream."""
+    return f"event: error\ndata: {json.dumps(error_body(error_type, message))}\n\n".encode()
 
 
 def write_log(request_log: RequestLogger, record: dict) -> None:
@@ -75,18 +88,123 @@ def write_log(request_log: RequestLogger, record: dict) -> None:
     request_log.write(record)
 
 
+API_ERROR_TYPES = {401: "authentication_error", 503: "overloaded_error", 504: "timeout_error"}
+
+
 def fail(record: dict, request_log: RequestLogger, started: float, status: int, error_type: str, message: str) -> JSONResponse:
     """Log a request that failed inside the gateway and return an Anthropic-shaped error."""
     record.update(status_code=status, outcome="error", error_type=error_type, latency_ms=elapsed_ms(started))
     write_log(request_log, record)
-    api_error = {503: "overloaded_error", 504: "timeout_error"}.get(status, "api_error")
-    return error_response(status, api_error, message)
+    return error_response(status, API_ERROR_TYPES.get(status, "api_error"), message)
+
+
+@dataclass
+class StreamFailure:
+    log_type: str  # error_type for the request log
+    api_type: str = "api_error"  # error type shown to the app
+    message: str = "Upstream stream failed."
+    from_event: bool = False  # Upstream sent an error event (vs. the connection failing).
+
+
+@dataclass
+class Upstream:
+    """Result of trying the model chain: a response, or why there isn't one."""
+
+    response: httpx.Response | None = None
+    served: str | None = None  # The model that produced `response`, if it succeeded.
+    status: int = 502
+    error_type: str = "upstream_unreachable"
+    message: str = "Could not reach Anthropic."
+    retry_after_s: int | None = None
+
+
+@dataclass
+class UpstreamCall:
+    """Everything needed to (re)send one app request through the model chain."""
+
+    http: httpx.AsyncClient
+    headers: dict[str, str]
+    timeout: httpx.Timeout | None
+    stream: bool
+    body: bytes
+    parsed: dict
+    model: str | None
+    chain: list[str | None]
+    policy: RetryPolicy
+    breaker: CircuitBreaker
+    attempts: list[Attempt] = field(default_factory=list)
+
+    def _sender(self, target: str | None):
+        target_body = self.body if target == self.model else json.dumps({**self.parsed, "model": target}).encode()
+
+        async def send() -> httpx.Response:
+            req = self.http.build_request("POST", "/v1/messages", content=target_body, headers=self.headers, timeout=self.timeout)
+            return await self.http.send(req, stream=self.stream)
+
+        return send
+
+    async def open(self, skip: frozenset[str | None] = frozenset()) -> Upstream:
+        """Try each model in the chain (with retries) until one answers.
+
+        Skips models whose circuit is open, and models in `skip` (ones whose
+        stream just failed) unless that would leave nothing to try. Falls back
+        only on 429/529/5xx or unreachable models; any other error is the
+        request's fault and is returned.
+        """
+        chain = [m for m in self.chain if m not in skip] or self.chain
+        first_failure: httpx.Response | None = None  # The requested model's error, if it failed.
+        last_failure: httpx.Response | None = None
+        tried_any = False
+        for position, target in enumerate(chain):
+            if target and not self.breaker.allow(target):
+                self.attempts.append(Attempt(model=target, error="circuit_open"))
+                continue
+            tried_any = True
+            tried_from = len(self.attempts)
+            try:
+                response = await send_with_retries(self._sender(target), self.policy, self.attempts, target)
+            except httpx.ReadTimeout:
+                return Upstream(status=504, error_type="upstream_timeout", message="Anthropic did not respond in time.")
+            except httpx.TransportError:
+                continue
+            finally:
+                if target:
+                    for attempt in self.attempts[tried_from:]:
+                        self.breaker.record(target, attempt_succeeded(attempt.status))
+
+            if response.status_code < 400:
+                return Upstream(response=response, served=target)
+            if not should_retry(response):
+                if position == 0:
+                    return Upstream(response=response)  # The request itself is bad; nothing to fall back from.
+                # The fallback model rejected the request outright (often a parameter
+                # it doesn't support). Report the requested model's failure instead
+                # of an error about a model the app never asked for.
+                await response.aclose()
+                break
+            # This model is failing; fall back to the next one.
+            await response.aread()
+            await response.aclose()
+            last_failure = response
+            if position == 0:
+                first_failure = response
+
+        if failure := first_failure or last_failure:
+            return Upstream(response=failure)
+        if not tried_any:
+            retry_after = max(1, round(self.breaker.retry_after_s([m for m in chain if m])))
+            return Upstream(
+                status=503,
+                error_type="circuit_open",
+                message=f"{self.model} and its fallbacks are unavailable.",
+                retry_after_s=retry_after,
+            )
+        return Upstream(message=f"Could not reach Anthropic ({self.attempts[-1].error}).")
 
 
 @router.post("/v1/messages")
 async def messages(request: Request) -> Response:
     started = time.perf_counter()
-    http: httpx.AsyncClient = request.app.state.http
     request_log: RequestLogger = request.app.state.request_log
     keys: KeyStore = request.app.state.keys
     limiter: RateLimiter = request.app.state.limiter
@@ -107,16 +225,14 @@ async def messages(request: Request) -> Response:
 
     api_key = await keys.authenticate(extract_key(request.headers))
     if api_key is None:
-        record.update(status_code=401, outcome="error", error_type="authentication_error", latency_ms=elapsed_ms(started))
-        request_log.write(record)
-        return error_response(401, "authentication_error", "Invalid or missing gateway API key.")
+        return fail(record, request_log, started, 401, "authentication_error", "Invalid or missing gateway API key.")
     record["api_key_id"] = api_key.id
 
     decision = await limiter.admit(api_key)
     if not decision.allowed:
         error_type = "gateway_budget_exceeded" if decision.limit == "monthly budget" else "gateway_rate_limited"
         record.update(status_code=429, outcome="error", error_type=error_type, latency_ms=elapsed_ms(started))
-        request_log.write(record)
+        write_log(request_log, record)
         response = error_response(429, "rate_limit_error", decision.message or "Gateway limit exceeded.")
         response.headers["retry-after"] = str(decision.retry_after_s)
         return response
@@ -130,74 +246,31 @@ async def messages(request: Request) -> Response:
         # For streams the read timeout is the longest allowed gap between events.
         timeout = httpx.Timeout(settings.upstream_stream_idle_timeout_s, connect=settings.upstream_connect_timeout_s)
 
-    def send_to(target_body: bytes):
-        async def send() -> httpx.Response:
-            upstream_req = http.build_request(
-                "POST", "/v1/messages", content=target_body, headers=headers, timeout=timeout
-            )
-            return await http.send(upstream_req, stream=stream)
-
-        return send
-
-    policy: RetryPolicy = request.app.state.retry_policy
-    attempts: list[Attempt] = []
-    record["attempts"] = attempts
-
-    breaker: CircuitBreaker = request.app.state.breaker
     chain = [model]
     if model and request.headers.get("x-gateway-fallback", "").lower() != "off":
         chain += request.app.state.fallback_chains.get(model, [])
+    call = UpstreamCall(
+        http=request.app.state.http,
+        headers=headers,
+        timeout=timeout,
+        stream=stream,
+        body=body,
+        parsed=parsed,
+        model=model,
+        chain=chain,
+        policy=request.app.state.retry_policy,
+        breaker=request.app.state.breaker,
+    )
+    record["attempts"] = call.attempts
 
-    upstream: httpx.Response | None = None  # The response to return.
-    served: str | None = None
-    first_failure: httpx.Response | None = None  # The requested model's error, if it failed.
-    last_failure: httpx.Response | None = None
-    for position, target in enumerate(chain):
-        if target and not breaker.allow(target):
-            attempts.append(Attempt(model=target, error="circuit_open"))
-            continue
-        target_body = body if target == model else json.dumps({**parsed, "model": target}).encode()
-        tried_from = len(attempts)
-        try:
-            response = await send_with_retries(send_to(target_body), policy, attempts, target)
-        except httpx.ReadTimeout:
-            return fail(record, request_log, started, 504, "upstream_timeout", "Anthropic did not respond in time.")
-        except httpx.TransportError:
-            continue
-        finally:
-            if target:
-                for attempt in attempts[tried_from:]:
-                    breaker.record(target, attempt_succeeded(attempt.status))
+    result = await call.open()
+    if result.response is None:
+        response = fail(record, request_log, started, result.status, result.error_type, result.message)
+        if result.retry_after_s is not None:
+            response.headers["retry-after"] = str(result.retry_after_s)
+        return response
 
-        if response.status_code < 400:
-            upstream, served = response, target
-            break
-        if not should_retry(response):
-            if position == 0:
-                upstream = response  # The request itself is bad; nothing to fall back from.
-            else:
-                # The fallback model rejected the request outright (often a parameter
-                # it doesn't support). Report the requested model's failure instead
-                # of an error about a model the app never asked for.
-                await response.aclose()
-            break
-        # This model is failing; fall back to the next one.
-        await response.aread()
-        await response.aclose()
-        last_failure = response
-        if position == 0:
-            first_failure = response
-
-    if upstream is None:
-        upstream = first_failure or last_failure
-    if upstream is None:
-        if all(a.error == "circuit_open" for a in attempts):
-            retry_after = max(1, round(breaker.retry_after_s([m for m in chain if m])))
-            response = fail(record, request_log, started, 503, "circuit_open", f"{model} and its fallbacks are unavailable.")
-            response.headers["retry-after"] = str(retry_after)
-            return response
-        message = f"Could not reach Anthropic ({attempts[-1].error})."
-        return fail(record, request_log, started, 502, "upstream_unreachable", message)
+    upstream, served = result.response, result.served
     upstream_ms = elapsed_ms(started)  # Including retries and fallbacks. For streams: until headers arrive.
     record.update(
         status_code=upstream.status_code,
@@ -208,7 +281,7 @@ async def messages(request: Request) -> Response:
     )
     response_headers = client_headers(upstream)
     response_headers["x-gateway-upstream-ms"] = f"{upstream_ms:.1f}"
-    response_headers["x-gateway-attempts"] = str(len(attempts))
+    response_headers["x-gateway-attempts"] = str(len(call.attempts))
     if served:
         response_headers["x-gateway-model"] = served
 
@@ -232,19 +305,92 @@ async def messages(request: Request) -> Response:
         return Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
 
     async def relay():
-        # Pass each chunk on as soon as it arrives, reading usage as it goes by.
-        # If the client disconnects, this generator is cancelled and the finally
-        # block closes the upstream connection, so Anthropic stops generating
-        # (and billing) tokens nobody will read.
+        """Relay the stream, recovering from failures that happen before any content.
+
+        Opening events (message_start, pings) are held back until the first
+        content delta. If the stream fails before then, the app has seen nothing
+        but a 200, so the gateway restarts it (retrying or falling back) and the
+        app never knows. After content has gone out, switching models would
+        splice two different answers together, so a failure ends the stream with
+        an Anthropic-style `error` event instead of a cut connection.
+
+        If the app disconnects, this generator is cancelled and the finally
+        blocks close the upstream connection, so Anthropic stops generating (and
+        billing) tokens nobody will read.
+        """
+        nonlocal upstream, served
+        recoveries = 0
+        failed_models: set[str | None] = set()
         tracker = StreamTracker()
         try:
-            async for chunk in upstream.aiter_bytes():  # decoded, in case upstream compresses anyway
-                tracker.feed(chunk)
-                if tracker.saw_content and record.get("ttft_ms") is None:
-                    record["ttft_ms"] = elapsed_ms(started)
-                yield chunk
+            while True:
+                tracker = StreamTracker()
+                held: list[bytes] = []
+                released = False
+                failure: StreamFailure | None = None
+                try:
+                    async for chunk in upstream.aiter_bytes():  # decoded, in case upstream compresses anyway
+                        tracker.feed(chunk)
+                        if released:
+                            yield chunk
+                            continue
+                        held.append(chunk)
+                        if tracker.saw_content or tracker.completed:
+                            record["ttft_ms"] = elapsed_ms(started)
+                            released = True
+                            yield b"".join(held)
+                            held = []
+                        elif tracker.error_type:
+                            failure = StreamFailure(tracker.error_type, from_event=True)
+                            break
+                except httpx.ReadTimeout:
+                    failure = StreamFailure("upstream_timeout", "timeout_error", "Anthropic stopped sending events.")
+                except httpx.TransportError as exc:
+                    message = f"Connection to Anthropic lost: {type(exc).__name__}"
+                    failure = StreamFailure("upstream_stream_interrupted", "api_error", message)
+                finally:
+                    await upstream.aclose()
+
+                if failure is None:
+                    if held:  # Ended without content or an error; pass on whatever came.
+                        yield b"".join(held)
+                    return
+
+                if served:
+                    call.breaker.record(served, False)
+                failed_models.add(served)
+                call.attempts.append(Attempt(model=served, error=f"stream:{failure.log_type}"))
+                tracker.error_type = failure.log_type
+
+                if released or recoveries >= MAX_STREAM_RECOVERIES:
+                    # Content already went out, or we've restarted enough: end cleanly.
+                    if failure.from_event and not released:
+                        yield b"".join(held)  # Upstream's own error event, unchanged.
+                    else:
+                        yield sse_error(failure.api_type, failure.message)
+                    return
+
+                # Nothing has reached the app yet: start over, retrying or falling back.
+                recoveries += 1
+                retry = await call.open(skip=frozenset(failed_models))
+                if retry.response is None:
+                    tracker.error_type = retry.error_type
+                    yield sse_error(API_ERROR_TYPES.get(retry.status, "api_error"), retry.message)
+                    return
+                if retry.response.status_code != 200:
+                    await retry.response.aread()
+                    await retry.response.aclose()
+                    error = parse_json_object(retry.response.content).get("error") or {}
+                    tracker.error_type = error.get("type") or f"http_{retry.response.status_code}"
+                    yield sse_error(error.get("type", "api_error"), error.get("message", "Upstream request failed."))
+                    return
+                upstream, served = retry.response, retry.served
+                record.update(
+                    served_model=served,
+                    fallback_used=served != model,
+                    upstream_request_id=upstream.headers.get("request-id"),
+                )
         finally:
-            await upstream.aclose()
             if tracker.error_type:
                 record.update(outcome="error", error_type=tracker.error_type)
             else:

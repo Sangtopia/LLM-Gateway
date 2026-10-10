@@ -7,3 +7,4 @@ sqlalchemy[asyncio]>=2.0.36
 aiosqlite>=0.20
 redis>=5.2
 fakeredis[lua]>=2.26
+anthropic>=1.13
