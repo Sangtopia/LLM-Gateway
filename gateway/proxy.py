@@ -11,6 +11,7 @@ from gateway.config import settings
 from gateway.db import RequestLogger
 from gateway.keys import KeyStore, extract_key
 from gateway.models import cost_usd
+from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
 from gateway.sse import StreamTracker
 
 router = APIRouter()
@@ -72,6 +73,7 @@ async def messages(request: Request) -> Response:
     http: httpx.AsyncClient = request.app.state.http
     request_log: RequestLogger = request.app.state.request_log
     keys: KeyStore = request.app.state.keys
+    limiter: RateLimiter = request.app.state.limiter
 
     body = await request.body()
     parsed = parse_json_object(body)
@@ -93,6 +95,16 @@ async def messages(request: Request) -> Response:
         request_log.write(record)
         return error_response(401, "authentication_error", "Invalid or missing gateway API key.")
     record["api_key_id"] = api_key.id
+
+    decision = await limiter.admit(api_key)
+    if not decision.allowed:
+        record.update(status_code=429, outcome="error", error_type="gateway_rate_limited", latency_ms=elapsed_ms(started))
+        request_log.write(record)
+        response = error_response(
+            429, "rate_limit_error", f"Gateway key {api_key.id} exceeded its {decision.limit} per minute limit."
+        )
+        response.headers["retry-after"] = str(decision.retry_after_s)
+        return response
 
     headers = upstream_headers(request)
     if stream:
@@ -126,7 +138,9 @@ async def messages(request: Request) -> Response:
         payload = parse_json_object(upstream.content)
         if upstream.status_code == 200:
             record.update(outcome="ok", stop_reason=payload.get("stop_reason"))
-            add_usage(record, payload.get("model") or model, payload.get("usage") or {})
+            usage = payload.get("usage") or {}
+            add_usage(record, payload.get("model") or model, usage)
+            limiter.charge_tokens(api_key, tokens_for_rate_limit(usage))
         else:
             error_type = (payload.get("error") or {}).get("type") or f"http_{upstream.status_code}"
             record.update(outcome="error", error_type=error_type)
@@ -154,6 +168,7 @@ async def messages(request: Request) -> Response:
                 record["outcome"] = "ok" if tracker.completed else "incomplete"
             record.update(stop_reason=tracker.stop_reason, latency_ms=elapsed_ms(started))
             add_usage(record, tracker.model or model, tracker.usage)
+            limiter.charge_tokens(api_key, tokens_for_rate_limit(tracker.usage))
             request_log.write(record)
 
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=response_headers)

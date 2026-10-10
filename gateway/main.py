@@ -2,12 +2,16 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from redis.asyncio import BlockingConnectionPool, Redis
+from redis.asyncio.retry import Retry
+from redis.backoff import NoBackoff
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from gateway.config import settings
 from gateway.db import RequestLogger, init_db
 from gateway.keys import KeyStore
 from gateway.proxy import router
+from gateway.ratelimit import RateLimiter
 
 
 @asynccontextmanager
@@ -19,8 +23,24 @@ async def lifespan(app: FastAPI):
     app.state.keys = KeyStore(engine)
     app.state.request_log = RequestLogger(engine)
     await app.state.request_log.start()
+    # Short timeouts and no automatic retries (redis-py's default retries add up
+    # to ~5s): if Redis is slow or down, the limiter fails open quickly instead of
+    # stalling requests. Pool size stays under Redis Cloud free tier's 30.
+    redis = Redis(
+        connection_pool=BlockingConnectionPool.from_url(
+            settings.redis_url,
+            max_connections=20,
+            timeout=1.0,
+            socket_timeout=1.0,
+            socket_connect_timeout=1.0,
+            retry=Retry(NoBackoff(), 0),
+        )
+    )
+    app.state.limiter = RateLimiter(redis)
     yield
     await app.state.http.aclose()
+    await app.state.limiter.drain()
+    await redis.aclose()
     await app.state.request_log.stop()
     await engine.dispose()
 

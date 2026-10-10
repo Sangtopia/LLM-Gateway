@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from gateway.config import settings
 from gateway.keys import ApiKey
 from gateway.main import app
+from gateway.ratelimit import ALLOW, Decision
 
 TEST_KEY = "gw-test-key"
 
@@ -24,11 +25,24 @@ class FakeKeyStore:
         return ApiKey(id="key_test", name="test") if plaintext == TEST_KEY else None
 
 
+class FakeLimiter:
+    def __init__(self, decision: Decision = ALLOW):
+        self.decision = decision
+        self.charged: list[tuple[str, int]] = []
+
+    async def admit(self, key: ApiKey) -> Decision:
+        return self.decision
+
+    def charge_tokens(self, key: ApiKey, tokens: int) -> None:
+        self.charged.append((key.id, tokens))
+
+
 def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     # Not used as a context manager, so the lifespan doesn't replace our fakes.
     app.state.http = httpx.AsyncClient(base_url="https://upstream.test", transport=httpx.MockTransport(handler))
     app.state.request_log = FakeRequestLog()
     app.state.keys = FakeKeyStore()
+    app.state.limiter = FakeLimiter()
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -229,3 +243,39 @@ def test_accepts_key_as_bearer_token():
         "/v1/messages", json={}, headers={"x-api-key": "", "authorization": f"Bearer {TEST_KEY}"}
     )
     assert resp.status_code == 200
+
+
+def test_rate_limited_key_gets_429_with_retry_after_and_upstream_is_not_called():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(200, json={})
+
+    client, log = make_client(handler)
+    app.state.limiter = FakeLimiter(Decision(False, retry_after_s=12, limit="requests"))
+    resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"})
+
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "12"
+    assert resp.json()["error"]["type"] == "rate_limit_error"
+    assert calls == []
+    [record] = log.records
+    assert record["error_type"] == "gateway_rate_limited"
+    assert record["api_key_id"] == "key_test"
+
+
+def test_charges_tokens_after_non_streaming_response():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"model": "claude-sonnet-5-5", "usage": USAGE})
+
+    client, _ = make_client(handler)
+    client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+    assert app.state.limiter.charged == [("key_test", 1_100)]
+
+
+def test_charges_tokens_after_stream_ends():
+    client, _ = make_client(stream_handler(SSE_EVENTS))
+    with client.stream("POST", "/v1/messages", json={"model": "claude-sonnet-5-5", "stream": True}) as resp:
+        resp.read()
+    assert app.state.limiter.charged == [("key_test", 1_100)]
