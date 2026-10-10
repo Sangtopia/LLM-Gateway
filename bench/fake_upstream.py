@@ -6,6 +6,8 @@ It can also misbehave on command, for testing retries and fallbacks:
     POST /_control {"fail_next": 2, "status": 529}   next 2 requests fail with 529
     POST /_control {"fail_rate": 0.3, "status": 500} 30% of requests fail
     POST /_control {"delay_ms": 2000}                 wait before answering
+    POST /_control {"fail_models": ["claude-sonnet-5-5"], "status": 529}
+                                                      that model always fails (others work)
     POST /_control {}                                 back to normal
     GET  /_control                                    current settings and request count
 """
@@ -32,7 +34,7 @@ MESSAGE = {
 
 ERROR_TYPES = {429: "rate_limit_error", 500: "api_error", 503: "api_error", 529: "overloaded_error"}
 
-DEFAULTS = {"fail_next": 0, "fail_rate": 0.0, "status": 529, "delay_ms": 0}
+DEFAULTS = {"fail_next": 0, "fail_rate": 0.0, "status": 529, "delay_ms": 0, "fail_models": []}
 state = {**DEFAULTS, "requests": 0}
 
 
@@ -63,7 +65,9 @@ async def get_control() -> dict:
     return state
 
 
-def should_fail() -> bool:
+def should_fail(model: str | None) -> bool:
+    if model in state["fail_models"]:
+        return True
     if state["fail_next"] > 0:
         state["fail_next"] -= 1
         return True
@@ -77,7 +81,7 @@ async def messages(request: Request) -> Response:
     if state["delay_ms"]:
         await asyncio.sleep(state["delay_ms"] / 1000)
 
-    if should_fail():
+    if should_fail(body.get("model")):
         status = state["status"]
         error = {"type": "error", "error": {"type": ERROR_TYPES.get(status, "api_error"), "message": "Injected failure"}}
         return Response(json.dumps(error), status_code=status, media_type="application/json")

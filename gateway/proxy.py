@@ -12,7 +12,7 @@ from gateway.db import RequestLogger
 from gateway.keys import KeyStore, extract_key
 from gateway.models import cost_usd
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
-from gateway.retry import Attempt, RetryPolicy, send_with_retries
+from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
 from gateway.sse import StreamTracker
 
 router = APIRouter()
@@ -129,35 +129,76 @@ async def messages(request: Request) -> Response:
         # For streams the read timeout is the longest allowed gap between events.
         timeout = httpx.Timeout(settings.upstream_stream_idle_timeout_s, connect=settings.upstream_connect_timeout_s)
 
-    async def send() -> httpx.Response:
-        upstream_req = http.build_request("POST", "/v1/messages", content=body, headers=headers, timeout=timeout)
-        return await http.send(upstream_req, stream=stream)
+    def send_to(target_body: bytes):
+        async def send() -> httpx.Response:
+            upstream_req = http.build_request(
+                "POST", "/v1/messages", content=target_body, headers=headers, timeout=timeout
+            )
+            return await http.send(upstream_req, stream=stream)
+
+        return send
 
     policy: RetryPolicy = request.app.state.retry_policy
     attempts: list[Attempt] = []
     record["attempts"] = attempts
-    try:
-        upstream = await send_with_retries(send, policy, attempts, model)
-    except httpx.ReadTimeout:
-        return fail(record, request_log, started, 504, "upstream_timeout", "Anthropic did not respond in time.")
-    except httpx.TransportError as exc:
-        message = f"Could not reach Anthropic: {type(exc).__name__}"
-        return fail(record, request_log, started, 502, "upstream_unreachable", message)
 
-    upstream_ms = elapsed_ms(started)  # Including retries. For streams: until headers arrive.
+    chain = [model]
+    if model and request.headers.get("x-gateway-fallback", "").lower() != "off":
+        chain += request.app.state.fallback_chains.get(model, [])
+
+    upstream = None
+    primary_failure: httpx.Response | None = None  # The requested model's last error, if it failed.
+    for position, target in enumerate(chain):
+        last = position == len(chain) - 1
+        target_body = body if target == model else json.dumps({**parsed, "model": target}).encode()
+        try:
+            upstream = await send_with_retries(send_to(target_body), policy, attempts, target)
+        except httpx.ReadTimeout:
+            return fail(record, request_log, started, 504, "upstream_timeout", "Anthropic did not respond in time.")
+        except httpx.TransportError as exc:
+            if not last:
+                continue
+            message = f"Could not reach Anthropic: {type(exc).__name__}"
+            return fail(record, request_log, started, 502, "upstream_unreachable", message)
+
+        if upstream.status_code < 400:
+            break
+        if position > 0 and not should_retry(upstream):
+            # The fallback model rejected the request outright (often a parameter
+            # it doesn't support). Report the requested model's failure instead of
+            # an error about a model the app never asked for.
+            await upstream.aclose()
+            if primary_failure is None:
+                return fail(record, request_log, started, 502, "upstream_unreachable", "Could not reach Anthropic.")
+            upstream = primary_failure
+            break
+        if last or not should_retry(upstream):
+            break
+        # This model is failing; fall back to the next one.
+        await upstream.aread()
+        await upstream.aclose()
+        if position == 0:
+            primary_failure = upstream
+
+    served = attempts[-1].model if upstream is not primary_failure else model
+    upstream_ms = elapsed_ms(started)  # Including retries and fallbacks. For streams: until headers arrive.
     record.update(
         status_code=upstream.status_code,
         upstream_ms=upstream_ms,
         upstream_request_id=upstream.headers.get("request-id"),
+        served_model=served if upstream.status_code < 400 else None,
+        fallback_used=upstream.status_code < 400 and served != model,
     )
     response_headers = client_headers(upstream)
     response_headers["x-gateway-upstream-ms"] = f"{upstream_ms:.1f}"
     response_headers["x-gateway-attempts"] = str(len(attempts))
+    if upstream.status_code < 400 and served:
+        response_headers["x-gateway-model"] = served
 
     # Errors arrive as a plain JSON body even when streaming was requested,
     # so read them fully and return them like a normal response.
     if not stream or upstream.status_code != 200:
-        if stream:
+        if stream and not upstream.is_stream_consumed:
             await upstream.aread()
             await upstream.aclose()
         payload = parse_json_object(upstream.content)

@@ -45,6 +45,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.keys = FakeKeyStore()
     app.state.limiter = FakeLimiter()
     app.state.retry_policy = RetryPolicy(max_retries=2, base_delay_s=0, max_delay_s=0)
+    app.state.fallback_chains = {"claude-sonnet-5-5": ["claude-sonnet-5", "claude-haiku-5-5"]}
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -327,3 +328,115 @@ def test_read_timeout_returns_504_without_retrying():
     assert resp.json()["error"]["type"] == "timeout_error"
     assert len(calls) == 1
     assert log.records[0]["error_type"] == "upstream_timeout"
+
+
+def by_model(behavior: dict):
+    """Upstream whose response depends on the requested model. Records models called."""
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        payload = json.loads(req.content)
+        model = payload["model"]
+        seen.append(model)
+        status = behavior.get(model, 200)
+        if status != 200:
+            error_type = "invalid_request_error" if status == 400 else "overloaded_error"
+            return httpx.Response(status, json={"type": "error", "error": {"type": error_type, "message": model}})
+        if payload.get("stream"):
+            events = [e.replace(b"claude-sonnet-5-5", model.encode()) for e in SSE_EVENTS]
+            return stream_handler(events)(req)
+        return httpx.Response(200, json={"model": model, "usage": USAGE, "stop_reason": "end_turn"})
+
+    return handler, seen
+
+
+def test_falls_back_to_next_model_after_retries_run_out():
+    handler, seen = by_model({"claude-sonnet-5-5": 529})
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5", "max_tokens": 10})
+
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "claude-sonnet-5"
+    assert resp.headers["x-gateway-model"] == "claude-sonnet-5"
+    assert seen == ["claude-sonnet-5-5"] * 3 + ["claude-sonnet-5"]
+    [record] = log.records
+    assert record["model"] == "claude-sonnet-5-5"
+    assert record["served_model"] == "claude-sonnet-5"
+    assert record["fallback_used"] is True
+    assert record["cost_usd"] == (1_000 * 2 + 100 * 10) / 1e6  # Priced as the model that answered.
+    assert [a["model"] for a in record["attempts"]] == seen
+
+
+def test_walks_the_whole_chain():
+    handler, seen = by_model({"claude-sonnet-5-5": 529, "claude-sonnet-5": 503})
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.json()["model"] == "claude-haiku-5-5"
+    assert seen[-1] == "claude-haiku-5-5" and len(seen) == 7
+    assert log.records[0]["served_model"] == "claude-haiku-5-5"
+
+
+def test_stream_falls_back_before_streaming_starts():
+    handler, seen = by_model({"claude-sonnet-5-5": 529})
+    client, log = make_client(handler)
+    with client.stream("POST", "/v1/messages", json={"model": "claude-sonnet-5-5", "stream": True}) as resp:
+        body = resp.read()
+
+    assert resp.status_code == 200
+    assert b'"model": "claude-sonnet-5"' in body
+    assert log.records[0]["fallback_used"] is True
+    assert log.records[0]["outcome"] == "ok"
+
+
+def test_whole_chain_failing_returns_last_error():
+    handler, seen = by_model({m: 529 for m in ("claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5")})
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.status_code == 529
+    assert len(seen) == 9
+    assert log.records[0]["fallback_used"] is False
+    assert log.records[0]["served_model"] is None
+
+
+def test_no_fallback_on_client_errors():
+    handler, seen = by_model({"claude-sonnet-5-5": 400})
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.status_code == 400
+    assert seen == ["claude-sonnet-5-5"]
+
+
+def test_fallback_model_rejecting_request_returns_primary_error():
+    handler, seen = by_model({"claude-sonnet-5-5": 529, "claude-sonnet-5": 400})
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.status_code == 529
+    assert resp.json()["error"]["message"] == "claude-sonnet-5-5"  # Not the fallback's 400.
+    assert seen == ["claude-sonnet-5-5"] * 3 + ["claude-sonnet-5"]
+
+
+def test_app_can_opt_out_of_fallback():
+    handler, seen = by_model({"claude-sonnet-5-5": 529})
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"}, headers={"x-gateway-fallback": "off"})
+
+    assert resp.status_code == 529
+    assert set(seen) == {"claude-sonnet-5-5"}
+
+
+def test_falls_back_when_primary_is_unreachable():
+    def handler(req: httpx.Request) -> httpx.Response:
+        if json.loads(req.content)["model"] == "claude-sonnet-5-5":
+            raise httpx.ConnectError("refused")
+        return httpx.Response(200, json={"model": "claude-sonnet-5", "usage": USAGE})
+
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.status_code == 200
+    assert log.records[0]["served_model"] == "claude-sonnet-5"
+    assert [a.get("error") for a in log.records[0]["attempts"]] == ["ConnectError"] * 3 + [None]

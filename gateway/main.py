@@ -23,6 +23,7 @@ async def lifespan(app: FastAPI):
         timeout=httpx.Timeout(settings.upstream_read_timeout_s, connect=settings.upstream_connect_timeout_s),
     )
     app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)
+    app.state.fallback_chains = settings.fallback_chains
     engine = create_async_engine(settings.database_url)
     await init_db(engine)
     app.state.keys = KeyStore(engine)

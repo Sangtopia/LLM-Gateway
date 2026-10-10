@@ -32,7 +32,8 @@ requests_table = Table(
     Column("id", String(36), primary_key=True),
     Column("created_at", DateTime(timezone=True), nullable=False, index=True),
     Column("api_key_id", String, index=True),  # None when the request had no valid key.
-    Column("model", String, index=True),
+    Column("model", String, index=True),  # As requested by the app.
+    Column("served_model", String, index=True),  # The model that answered (differs after a fallback).
     Column("provider", String, nullable=False),
     Column("stream", Boolean, nullable=False),
     Column("status_code", Integer, nullable=False),

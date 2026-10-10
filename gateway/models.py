@@ -53,6 +53,18 @@ MODELS: dict[str, ModelInfo] = {
 }
 
 
+# Models to try, in order, when a model keeps failing (429/529/5xx after retries).
+# Each chain tries the previous version of the same model first: similar quality,
+# and Anthropic tracks rate limits per model. There's no fallback from Haiku,
+# since stepping up to a pricier model should be a deliberate choice.
+# All models here share the Claude 5 request surface (adaptive thinking, effort).
+DEFAULT_FALLBACKS: dict[str, list[str]] = {
+    "claude-fable-5-1": ["claude-fable-5", "claude-opus-5-5"],
+    "claude-opus-5-5": ["claude-opus-5", "claude-sonnet-5-5"],
+    "claude-sonnet-5-5": ["claude-sonnet-5", "claude-haiku-5-5"],
+}
+
+
 def format_usd(amount: float) -> str:
     """Dollars for people: cents normally, more digits for sub-cent amounts."""
     if amount == 0 or abs(amount) >= 0.01:

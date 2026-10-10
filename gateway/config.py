@@ -1,4 +1,7 @@
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from gateway.models import DEFAULT_FALLBACKS
 
 
 class Settings(BaseSettings):
@@ -13,6 +16,9 @@ class Settings(BaseSettings):
     upstream_read_timeout_s: float = 600.0  # Whole response, non-streaming. Long generations take minutes.
     upstream_stream_idle_timeout_s: float = 60.0  # Max gap between stream events; Anthropic sends pings.
     upstream_max_retries: int = 2
+
+    # JSON in the environment, e.g. FALLBACK_CHAINS={"claude-sonnet-5-5": ["claude-haiku-5-5"]}
+    fallback_chains: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_FALLBACKS))
 
 
 settings = Settings()
