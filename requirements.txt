@@ -5,3 +5,4 @@ pydantic-settings>=2.4
 pytest>=8.3
 sqlalchemy[asyncio]>=2.0.36
 aiosqlite>=0.20
+redis>=5.2
