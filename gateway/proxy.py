@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from gateway.config import settings
 from gateway.db import RequestLogger
+from gateway.keys import KeyStore, extract_key
 from gateway.models import cost_usd
 from gateway.sse import StreamTracker
 
@@ -70,6 +71,7 @@ async def messages(request: Request) -> Response:
     started = time.perf_counter()
     http: httpx.AsyncClient = request.app.state.http
     request_log: RequestLogger = request.app.state.request_log
+    keys: KeyStore = request.app.state.keys
 
     body = await request.body()
     parsed = parse_json_object(body)
@@ -84,6 +86,13 @@ async def messages(request: Request) -> Response:
         "cache_hit": False,
         "fallback_used": False,
     }
+
+    api_key = await keys.authenticate(extract_key(request.headers))
+    if api_key is None:
+        record.update(status_code=401, outcome="error", error_type="authentication_error", latency_ms=elapsed_ms(started))
+        request_log.write(record)
+        return error_response(401, "authentication_error", "Invalid or missing gateway API key.")
+    record["api_key_id"] = api_key.id
 
     headers = upstream_headers(request)
     if stream:

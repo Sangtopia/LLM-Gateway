@@ -5,7 +5,10 @@ import httpx
 from fastapi.testclient import TestClient
 
 from gateway.config import settings
+from gateway.keys import ApiKey
 from gateway.main import app
+
+TEST_KEY = "gw-test-key"
 
 
 class FakeRequestLog:
@@ -16,11 +19,17 @@ class FakeRequestLog:
         self.records.append(record)
 
 
+class FakeKeyStore:
+    async def authenticate(self, plaintext: str | None) -> ApiKey | None:
+        return ApiKey(id="key_test", name="test") if plaintext == TEST_KEY else None
+
+
 def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     # Not used as a context manager, so the lifespan doesn't replace our fakes.
     app.state.http = httpx.AsyncClient(base_url="https://upstream.test", transport=httpx.MockTransport(handler))
     app.state.request_log = FakeRequestLog()
-    return TestClient(app), app.state.request_log
+    app.state.keys = FakeKeyStore()
+    return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
 USAGE = {"input_tokens": 1_000, "output_tokens": 100, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}
@@ -39,7 +48,7 @@ def test_forwards_request_and_swaps_key():
     resp = client.post(
         "/v1/messages",
         json={"model": "claude-haiku-5-5", "max_tokens": 10, "messages": []},
-        headers={"x-api-key": "gw-client-key", "anthropic-beta": "some-beta"},
+        headers={"anthropic-beta": "some-beta"},
     )
 
     assert resp.status_code == 200
@@ -62,6 +71,7 @@ def test_logs_successful_request_with_usage_and_cost():
     client.post("/v1/messages", json={"model": "claude-sonnet-5-5", "messages": []})
 
     [record] = log.records
+    assert record["api_key_id"] == "key_test"
     assert record["model"] == "claude-sonnet-5-5"
     assert record["stream"] is False
     assert record["status_code"] == 200
@@ -192,3 +202,30 @@ def test_stream_asks_upstream_not_to_compress_and_decodes_if_it_does():
     with client.stream("POST", "/v1/messages", json={"stream": True}) as resp:
         assert resp.read() == b"".join(SSE_EVENTS)
     assert seen["accept-encoding"] == "identity"
+
+
+def test_rejects_missing_or_unknown_key_without_calling_upstream():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        return httpx.Response(200, json={})
+
+    client, log = make_client(handler)
+    missing = client.post("/v1/messages", json={"model": "claude-haiku-5-5"}, headers={"x-api-key": ""})
+    wrong = client.post("/v1/messages", json={"model": "claude-haiku-5-5"}, headers={"x-api-key": "gw-wrong"})
+
+    for resp in (missing, wrong):
+        assert resp.status_code == 401
+        assert resp.json()["error"]["type"] == "authentication_error"
+    assert calls == []
+    assert [r["error_type"] for r in log.records] == ["authentication_error"] * 2
+    assert all(r.get("api_key_id") is None for r in log.records)
+
+
+def test_accepts_key_as_bearer_token():
+    client, _ = make_client(lambda req: httpx.Response(200, json={}))
+    resp = client.post(
+        "/v1/messages", json={}, headers={"x-api-key": "", "authorization": f"Bearer {TEST_KEY}"}
+    )
+    assert resp.status_code == 200

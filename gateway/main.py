@@ -5,7 +5,8 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from gateway.config import settings
-from gateway.db import RequestLogger
+from gateway.db import RequestLogger, init_db
+from gateway.keys import KeyStore
 from gateway.proxy import router
 
 
@@ -14,6 +15,8 @@ async def lifespan(app: FastAPI):
     # One pooled client for the whole app, so connections to Anthropic are reused.
     app.state.http = httpx.AsyncClient(base_url=settings.anthropic_base_url, timeout=httpx.Timeout(600.0, connect=10.0))
     engine = create_async_engine(settings.database_url)
+    await init_db(engine)
+    app.state.keys = KeyStore(engine)
     app.state.request_log = RequestLogger(engine)
     await app.state.request_log.start()
     yield

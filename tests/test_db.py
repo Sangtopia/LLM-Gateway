@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from gateway.db import RequestLogger, requests_table
+from gateway.db import RequestLogger, init_db, requests_table
 
 
 def record(**overrides) -> dict:
@@ -27,6 +27,7 @@ def record(**overrides) -> dict:
 def test_writes_queued_records_and_flushes_on_stop(tmp_path):
     async def run():
         engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'test.db'}")
+        await init_db(engine)
         logger = RequestLogger(engine)
         await logger.start()
         for i in range(25):

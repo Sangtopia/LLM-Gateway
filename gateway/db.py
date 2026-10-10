@@ -1,4 +1,4 @@
-"""Request log storage. One row per request through the gateway."""
+"""Database tables (API keys, request log) and the background request log writer."""
 
 import asyncio
 import logging
@@ -15,7 +15,7 @@ requests_table = Table(
     metadata,
     Column("id", String(36), primary_key=True),
     Column("created_at", DateTime(timezone=True), nullable=False, index=True),
-    Column("api_key_id", String, index=True),  # Filled in once virtual keys exist (Stage 4).
+    Column("api_key_id", String, index=True),  # None when the request had no valid key.
     Column("model", String, index=True),
     Column("provider", String, nullable=False),
     Column("stream", Boolean, nullable=False),
@@ -36,6 +36,26 @@ requests_table = Table(
     Column("upstream_request_id", String),
 )
 
+api_keys_table = Table(
+    "api_keys",
+    metadata,
+    Column("id", String, primary_key=True),
+    Column("name", String, nullable=False),
+    Column("key_hash", String(64), nullable=False, unique=True),  # SHA-256 hex; the key itself is never stored.
+    Column("key_prefix", String, nullable=False),  # First characters, to tell keys apart in listings.
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("revoked_at", DateTime(timezone=True)),
+    # Limits; None means unlimited.
+    Column("rpm_limit", Integer),
+    Column("tpm_limit", Integer),
+    Column("monthly_budget_usd", Float),
+)
+
+
+async def init_db(engine: AsyncEngine) -> None:
+    async with engine.begin() as conn:
+        await conn.run_sync(metadata.create_all)
+
 
 class RequestLogger:
     """Writes request records in the background so logging never delays a response.
@@ -52,8 +72,6 @@ class RequestLogger:
         self._task: asyncio.Task | None = None
 
     async def start(self) -> None:
-        async with self._engine.begin() as conn:
-            await conn.run_sync(metadata.create_all)
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
