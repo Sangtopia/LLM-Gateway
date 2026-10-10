@@ -8,6 +8,7 @@ from gateway.config import settings
 from gateway.keys import ApiKey
 from gateway.main import app
 from gateway.ratelimit import ALLOW, Decision
+from gateway.retry import RetryPolicy
 
 TEST_KEY = "gw-test-key"
 
@@ -43,6 +44,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.request_log = FakeRequestLog()
     app.state.keys = FakeKeyStore()
     app.state.limiter = FakeLimiter()
+    app.state.retry_policy = RetryPolicy(max_retries=2, base_delay_s=0, max_delay_s=0)
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -289,3 +291,39 @@ def test_charges_tokens_after_stream_ends():
     with client.stream("POST", "/v1/messages", json={"model": "claude-sonnet-5-5", "stream": True}) as resp:
         resp.read()
     assert app.state.limiter.charged == [("key_test", 1_100, (1_000 * 2 + 100 * 10) / 1e6)]
+
+
+def test_retries_overloaded_upstream_and_logs_each_attempt():
+    statuses = iter([529, 529, 200])
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        status = next(statuses)
+        if status == 200:
+            return httpx.Response(200, json={"model": "claude-sonnet-5-5", "usage": USAGE})
+        return httpx.Response(status, json={"type": "error", "error": {"type": "overloaded_error"}})
+
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.status_code == 200
+    assert resp.headers["x-gateway-attempts"] == "3"
+    [record] = log.records
+    assert record["outcome"] == "ok"
+    assert [a["status"] for a in record["attempts"]] == [529, 529, 200]
+    assert all(a["model"] == "claude-sonnet-5-5" for a in record["attempts"])
+
+
+def test_read_timeout_returns_504_without_retrying():
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(req)
+        raise httpx.ReadTimeout("slow", request=req)
+
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"})
+
+    assert resp.status_code == 504
+    assert resp.json()["error"]["type"] == "timeout_error"
+    assert len(calls) == 1
+    assert log.records[0]["error_type"] == "upstream_timeout"

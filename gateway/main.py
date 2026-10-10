@@ -12,12 +12,17 @@ from gateway.db import RequestLogger, init_db, spend_since
 from gateway.keys import KeyStore
 from gateway.proxy import router
 from gateway.ratelimit import RateLimiter
+from gateway.retry import RetryPolicy
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # One pooled client for the whole app, so connections to Anthropic are reused.
-    app.state.http = httpx.AsyncClient(base_url=settings.anthropic_base_url, timeout=httpx.Timeout(600.0, connect=10.0))
+    app.state.http = httpx.AsyncClient(
+        base_url=settings.anthropic_base_url,
+        timeout=httpx.Timeout(settings.upstream_read_timeout_s, connect=settings.upstream_connect_timeout_s),
+    )
+    app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)
     engine = create_async_engine(settings.database_url)
     await init_db(engine)
     app.state.keys = KeyStore(engine)

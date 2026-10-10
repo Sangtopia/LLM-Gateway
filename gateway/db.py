@@ -4,7 +4,22 @@ import asyncio
 import logging
 from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, MetaData, String, Table, func, insert, select
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    func,
+    insert,
+    inspect,
+    select,
+    text,
+)
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 log = logging.getLogger(__name__)
@@ -35,6 +50,7 @@ requests_table = Table(
     Column("cache_hit", Boolean, nullable=False, default=False),
     Column("fallback_used", Boolean, nullable=False, default=False),
     Column("upstream_request_id", String),
+    Column("attempts", JSON),  # One entry per upstream try: model, status or error, timing, retry wait.
 )
 
 api_keys_table = Table(
@@ -56,6 +72,24 @@ api_keys_table = Table(
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+        await conn.run_sync(_add_missing_columns)
+
+
+def _add_missing_columns(sync_conn) -> None:
+    """Add columns introduced after a table was first created.
+
+    create_all only creates missing tables. This covers the simple case of new
+    nullable columns without a migration tool; anything more involved (renames,
+    type changes) would need Alembic.
+    """
+    inspector = inspect(sync_conn)
+    for table in metadata.sorted_tables:
+        existing = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name not in existing and column.nullable:
+                col_type = column.type.compile(dialect=sync_conn.dialect)
+                sync_conn.execute(text(f'ALTER TABLE {table.name} ADD COLUMN "{column.name}" {col_type}'))
+                log.info("added column %s.%s", table.name, column.name)
 
 
 async def spend_since(engine: AsyncEngine, key_id: str, since: datetime) -> float:

@@ -12,6 +12,7 @@ from gateway.db import RequestLogger
 from gateway.keys import KeyStore, extract_key
 from gateway.models import cost_usd
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
+from gateway.retry import Attempt, RetryPolicy, send_with_retries
 from gateway.sse import StreamTracker
 
 router = APIRouter()
@@ -67,6 +68,20 @@ def error_response(status: int, error_type: str, message: str) -> JSONResponse:
     return JSONResponse({"type": "error", "error": {"type": error_type, "message": message}}, status_code=status)
 
 
+def write_log(request_log: RequestLogger, record: dict) -> None:
+    if isinstance(record.get("attempts"), list):
+        record["attempts"] = [a.as_dict() if isinstance(a, Attempt) else a for a in record["attempts"]]
+    request_log.write(record)
+
+
+def fail(record: dict, request_log: RequestLogger, started: float, status: int, error_type: str, message: str) -> JSONResponse:
+    """Log a request that failed inside the gateway and return an Anthropic-shaped error."""
+    record.update(status_code=status, outcome="error", error_type=error_type, latency_ms=elapsed_ms(started))
+    write_log(request_log, record)
+    api_error = "timeout_error" if status == 504 else "api_error"
+    return error_response(status, api_error, message)
+
+
 @router.post("/v1/messages")
 async def messages(request: Request) -> Response:
     started = time.perf_counter()
@@ -106,20 +121,30 @@ async def messages(request: Request) -> Response:
         return response
 
     headers = upstream_headers(request)
+    timeout = None
     if stream:
         # Compression would make the upstream buffer events into batches, and
         # we'd have to re-encode for the client anyway. Ask for plain bytes.
         headers["accept-encoding"] = "identity"
-    upstream_req = http.build_request("POST", "/v1/messages", content=body, headers=headers)
+        # For streams the read timeout is the longest allowed gap between events.
+        timeout = httpx.Timeout(settings.upstream_stream_idle_timeout_s, connect=settings.upstream_connect_timeout_s)
 
+    async def send() -> httpx.Response:
+        upstream_req = http.build_request("POST", "/v1/messages", content=body, headers=headers, timeout=timeout)
+        return await http.send(upstream_req, stream=stream)
+
+    policy: RetryPolicy = request.app.state.retry_policy
+    attempts: list[Attempt] = []
+    record["attempts"] = attempts
     try:
-        upstream = await http.send(upstream_req, stream=stream)
+        upstream = await send_with_retries(send, policy, attempts, model)
+    except httpx.ReadTimeout:
+        return fail(record, request_log, started, 504, "upstream_timeout", "Anthropic did not respond in time.")
     except httpx.TransportError as exc:
-        record.update(status_code=502, outcome="error", error_type="upstream_unreachable", latency_ms=elapsed_ms(started))
-        request_log.write(record)
-        return error_response(502, "api_error", f"Could not reach Anthropic: {type(exc).__name__}")
+        message = f"Could not reach Anthropic: {type(exc).__name__}"
+        return fail(record, request_log, started, 502, "upstream_unreachable", message)
 
-    upstream_ms = elapsed_ms(started)  # For streams: time until headers arrive.
+    upstream_ms = elapsed_ms(started)  # Including retries. For streams: until headers arrive.
     record.update(
         status_code=upstream.status_code,
         upstream_ms=upstream_ms,
@@ -127,6 +152,7 @@ async def messages(request: Request) -> Response:
     )
     response_headers = client_headers(upstream)
     response_headers["x-gateway-upstream-ms"] = f"{upstream_ms:.1f}"
+    response_headers["x-gateway-attempts"] = str(len(attempts))
 
     # Errors arrive as a plain JSON body even when streaming was requested,
     # so read them fully and return them like a normal response.
@@ -144,7 +170,7 @@ async def messages(request: Request) -> Response:
             error_type = (payload.get("error") or {}).get("type") or f"http_{upstream.status_code}"
             record.update(outcome="error", error_type=error_type)
         record["latency_ms"] = elapsed_ms(started)
-        request_log.write(record)
+        write_log(request_log, record)
         return Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
 
     async def relay():
@@ -168,6 +194,6 @@ async def messages(request: Request) -> Response:
             record.update(stop_reason=tracker.stop_reason, latency_ms=elapsed_ms(started))
             add_usage(record, tracker.model or model, tracker.usage)
             limiter.record_usage(api_key, tokens_for_rate_limit(tracker.usage), record["cost_usd"])
-            request_log.write(record)
+            write_log(request_log, record)
 
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=response_headers)
