@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     upstream_read_timeout_s: float = 600.0  # Whole response, non-streaming. Long generations take minutes.
     upstream_stream_idle_timeout_s: float = 60.0  # Max gap between stream events; Anthropic sends pings.
     upstream_max_retries: int = 2
+    circuit_failure_threshold: int = 5  # Consecutive failed attempts before a model is skipped.
+    circuit_cooldown_s: float = 30.0  # Before letting a probe request through.
 
     # JSON in the environment, e.g. FALLBACK_CHAINS={"claude-sonnet-5-5": ["claude-haiku-5-5"]}
     fallback_chains: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_FALLBACKS))

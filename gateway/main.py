@@ -7,6 +7,7 @@ from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from gateway.circuit import CircuitBreaker
 from gateway.config import settings
 from gateway.db import RequestLogger, init_db, spend_since
 from gateway.keys import KeyStore
@@ -24,6 +25,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)
     app.state.fallback_chains = settings.fallback_chains
+    app.state.breaker = CircuitBreaker(settings.circuit_failure_threshold, settings.circuit_cooldown_s)
     engine = create_async_engine(settings.database_url)
     await init_db(engine)
     app.state.keys = KeyStore(engine)
@@ -57,4 +59,8 @@ app.include_router(router)
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "upstream_key_configured": bool(settings.anthropic_api_key)}
+    return {
+        "status": "ok",
+        "upstream_key_configured": bool(settings.anthropic_api_key),
+        "circuits": app.state.breaker.snapshot(),  # Models currently skipped or probing.
+    }

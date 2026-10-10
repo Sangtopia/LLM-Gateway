@@ -4,6 +4,7 @@ import json
 import httpx
 from fastapi.testclient import TestClient
 
+from gateway.circuit import CircuitBreaker
 from gateway.config import settings
 from gateway.keys import ApiKey
 from gateway.main import app
@@ -46,6 +47,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.limiter = FakeLimiter()
     app.state.retry_policy = RetryPolicy(max_retries=2, base_delay_s=0, max_delay_s=0)
     app.state.fallback_chains = {"claude-sonnet-5-5": ["claude-sonnet-5", "claude-haiku-5-5"]}
+    app.state.breaker = CircuitBreaker(failure_threshold=1_000)  # Effectively off; tested on its own.
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -440,3 +442,44 @@ def test_falls_back_when_primary_is_unreachable():
     assert resp.status_code == 200
     assert log.records[0]["served_model"] == "claude-sonnet-5"
     assert [a.get("error") for a in log.records[0]["attempts"]] == ["ConnectError"] * 3 + [None]
+
+
+def test_open_circuit_skips_model_and_goes_straight_to_fallback():
+    handler, seen = by_model({"claude-sonnet-5-5": 529})
+    client, log = make_client(handler)
+    app.state.breaker = CircuitBreaker(failure_threshold=3)
+
+    first = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})  # 3 failures open the circuit.
+    seen.clear()
+    second = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert first.headers["x-gateway-model"] == second.headers["x-gateway-model"] == "claude-sonnet-5"
+    assert seen == ["claude-sonnet-5"]  # Sonnet 5.5 wasn't even tried.
+    assert log.records[1]["attempts"][0] == {"model": "claude-sonnet-5-5", "error": "circuit_open", "ms": 0.0}
+    assert log.records[1]["fallback_used"] is True
+
+
+def test_all_circuits_open_fails_fast_with_503():
+    handler, seen = by_model({})
+    client, log = make_client(handler)
+    breaker = CircuitBreaker(failure_threshold=1, cooldown_s=30)
+    for m in ("claude-sonnet-5-5", "claude-sonnet-5", "claude-haiku-5-5"):
+        breaker.record(m, False)
+    app.state.breaker = breaker
+
+    resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["type"] == "overloaded_error"
+    assert 1 <= int(resp.headers["retry-after"]) <= 30
+    assert seen == []
+    assert log.records[0]["error_type"] == "circuit_open"
+
+
+def test_client_errors_do_not_trip_the_breaker():
+    handler, _ = by_model({"claude-sonnet-5-5": 400})
+    client, _ = make_client(handler)
+    app.state.breaker = CircuitBreaker(failure_threshold=2)
+    for _ in range(5):
+        client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+    assert app.state.breaker.state("claude-sonnet-5-5") == "closed"
