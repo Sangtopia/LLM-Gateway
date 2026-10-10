@@ -1,6 +1,6 @@
 import pytest
 
-from gateway.models import MODELS, cost_usd, get_model
+from gateway.models import MODELS, cost_usd, format_usd, get_model
 
 
 def test_unknown_model_has_no_cost():
@@ -61,3 +61,10 @@ def test_us_only_inference_costs_10_percent_more_on_newer_models():
 def test_registry_ids_match_keys():
     for key, model in MODELS.items():
         assert key == model.id
+
+
+def test_format_usd():
+    assert format_usd(0) == "$0.00"
+    assert format_usd(20) == "$20.00"
+    assert format_usd(1234.5) == "$1,234.50"
+    assert format_usd(0.0000134) == "$0.0000134"

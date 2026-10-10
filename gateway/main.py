@@ -8,7 +8,7 @@ from redis.backoff import NoBackoff
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from gateway.config import settings
-from gateway.db import RequestLogger, init_db
+from gateway.db import RequestLogger, init_db, spend_since
 from gateway.keys import KeyStore
 from gateway.proxy import router
 from gateway.ratelimit import RateLimiter
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
             retry=Retry(NoBackoff(), 0),
         )
     )
-    app.state.limiter = RateLimiter(redis)
+    app.state.limiter = RateLimiter(redis, load_spend=lambda key_id, since: spend_since(engine, key_id, since))
     yield
     await app.state.http.aclose()
     await app.state.limiter.drain()

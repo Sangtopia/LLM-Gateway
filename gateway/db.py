@@ -2,8 +2,9 @@
 
 import asyncio
 import logging
+from datetime import datetime
 
-from sqlalchemy import Boolean, Column, DateTime, Float, Integer, MetaData, String, Table, insert
+from sqlalchemy import Boolean, Column, DateTime, Float, Integer, MetaData, String, Table, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 log = logging.getLogger(__name__)
@@ -55,6 +56,14 @@ api_keys_table = Table(
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)
+
+
+async def spend_since(engine: AsyncEngine, key_id: str, since: datetime) -> float:
+    """Dollars a key has spent since `since`, from the request log."""
+    t = requests_table
+    query = select(func.coalesce(func.sum(t.c.cost_usd), 0.0)).where(t.c.api_key_id == key_id, t.c.created_at >= since)
+    async with engine.connect() as conn:
+        return float((await conn.execute(query)).scalar_one())
 
 
 class RequestLogger:

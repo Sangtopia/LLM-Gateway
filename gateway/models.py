@@ -53,6 +53,13 @@ MODELS: dict[str, ModelInfo] = {
 }
 
 
+def format_usd(amount: float) -> str:
+    """Dollars for people: cents normally, more digits for sub-cent amounts."""
+    if amount == 0 or abs(amount) >= 0.01:
+        return f"${amount:,.2f}"
+    return f"${amount:.8f}".rstrip("0")
+
+
 def get_model(model_id: str) -> ModelInfo | None:
     return MODELS.get(model_id)
 

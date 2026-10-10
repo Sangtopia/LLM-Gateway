@@ -50,7 +50,7 @@ def test_tokens_per_minute_charges_after_the_fact_and_can_go_negative():
         limiter = RateLimiter(redis)
         key = ApiKey("key_a", "a", tpm_limit=1_000)
         first = await limiter.admit(key)  # Bucket is full, so admitted.
-        limiter.charge_tokens(key, 5_000)  # Response used far more than the limit.
+        limiter.record_usage(key, 5_000, None)  # Response used far more than the limit.
         await limiter.drain()
         second = await limiter.admit(key)
         ttl_ms = await redis.pttl("gw:rl:key_a:tpm")
@@ -71,7 +71,7 @@ def test_rejected_request_takes_nothing_from_other_buckets():
         limiter = RateLimiter(redis)
         key = ApiKey("key_a", "a", rpm_limit=10, tpm_limit=1_000)
         await limiter.admit(key)
-        limiter.charge_tokens(key, 5_000)
+        limiter.record_usage(key, 5_000, None)
         await limiter.drain()
         rejected = await limiter.admit(key)
         level = float(await redis.hget("gw:rl:key_a:rpm", "level"))
@@ -87,7 +87,7 @@ def test_unlimited_key_never_calls_redis():
         broken = unreachable_redis()
         limiter = RateLimiter(broken)
         decision = await limiter.admit(ApiKey("key_a", "a"))
-        limiter.charge_tokens(ApiKey("key_a", "a"), 1_000)
+        limiter.record_usage(ApiKey("key_a", "a"), 1_000, 0.5)
         await limiter.drain()
         await broken.aclose()
         return decision
@@ -103,7 +103,7 @@ def test_fails_open_when_redis_is_down_and_stops_trying_for_a_while():
         first = await limiter.admit(key)  # Pays for the failed connection attempt.
         start = time.perf_counter()
         rest = await admit_n(limiter, key, 50)
-        limiter.charge_tokens(key, 1_000)
+        limiter.record_usage(key, 1_000, None)
         await limiter.drain()  # Must not raise.
         elapsed = time.perf_counter() - start
         await broken.aclose()

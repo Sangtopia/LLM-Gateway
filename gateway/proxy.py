@@ -98,11 +98,10 @@ async def messages(request: Request) -> Response:
 
     decision = await limiter.admit(api_key)
     if not decision.allowed:
-        record.update(status_code=429, outcome="error", error_type="gateway_rate_limited", latency_ms=elapsed_ms(started))
+        error_type = "gateway_budget_exceeded" if decision.limit == "monthly budget" else "gateway_rate_limited"
+        record.update(status_code=429, outcome="error", error_type=error_type, latency_ms=elapsed_ms(started))
         request_log.write(record)
-        response = error_response(
-            429, "rate_limit_error", f"Gateway key {api_key.id} exceeded its {decision.limit} per minute limit."
-        )
+        response = error_response(429, "rate_limit_error", decision.message or "Gateway limit exceeded.")
         response.headers["retry-after"] = str(decision.retry_after_s)
         return response
 
@@ -140,7 +139,7 @@ async def messages(request: Request) -> Response:
             record.update(outcome="ok", stop_reason=payload.get("stop_reason"))
             usage = payload.get("usage") or {}
             add_usage(record, payload.get("model") or model, usage)
-            limiter.charge_tokens(api_key, tokens_for_rate_limit(usage))
+            limiter.record_usage(api_key, tokens_for_rate_limit(usage), record["cost_usd"])
         else:
             error_type = (payload.get("error") or {}).get("type") or f"http_{upstream.status_code}"
             record.update(outcome="error", error_type=error_type)
@@ -168,7 +167,7 @@ async def messages(request: Request) -> Response:
                 record["outcome"] = "ok" if tracker.completed else "incomplete"
             record.update(stop_reason=tracker.stop_reason, latency_ms=elapsed_ms(started))
             add_usage(record, tracker.model or model, tracker.usage)
-            limiter.charge_tokens(api_key, tokens_for_rate_limit(tracker.usage))
+            limiter.record_usage(api_key, tokens_for_rate_limit(tracker.usage), record["cost_usd"])
             request_log.write(record)
 
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=response_headers)

@@ -28,13 +28,13 @@ class FakeKeyStore:
 class FakeLimiter:
     def __init__(self, decision: Decision = ALLOW):
         self.decision = decision
-        self.charged: list[tuple[str, int]] = []
+        self.charged: list[tuple[str, int, float | None]] = []
 
     async def admit(self, key: ApiKey) -> Decision:
         return self.decision
 
-    def charge_tokens(self, key: ApiKey, tokens: int) -> None:
-        self.charged.append((key.id, tokens))
+    def record_usage(self, key: ApiKey, tokens: int, cost_usd: float | None) -> None:
+        self.charged.append((key.id, tokens, cost_usd))
 
 
 def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
@@ -253,16 +253,26 @@ def test_rate_limited_key_gets_429_with_retry_after_and_upstream_is_not_called()
         return httpx.Response(200, json={})
 
     client, log = make_client(handler)
-    app.state.limiter = FakeLimiter(Decision(False, retry_after_s=12, limit="requests"))
+    app.state.limiter = FakeLimiter(Decision(False, retry_after_s=12, limit="requests", message="too fast"))
     resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"})
 
     assert resp.status_code == 429
     assert resp.headers["retry-after"] == "12"
-    assert resp.json()["error"]["type"] == "rate_limit_error"
+    assert resp.json()["error"] == {"type": "rate_limit_error", "message": "too fast"}
     assert calls == []
     [record] = log.records
     assert record["error_type"] == "gateway_rate_limited"
     assert record["api_key_id"] == "key_test"
+
+
+def test_budget_exceeded_is_logged_separately_from_rate_limits():
+    client, log = make_client(lambda req: httpx.Response(200, json={}))
+    app.state.limiter = FakeLimiter(Decision(False, retry_after_s=86_400, limit="monthly budget", message="broke"))
+    resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"})
+
+    assert resp.status_code == 429
+    assert resp.headers["retry-after"] == "86400"
+    assert log.records[0]["error_type"] == "gateway_budget_exceeded"
 
 
 def test_charges_tokens_after_non_streaming_response():
@@ -271,11 +281,11 @@ def test_charges_tokens_after_non_streaming_response():
 
     client, _ = make_client(handler)
     client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
-    assert app.state.limiter.charged == [("key_test", 1_100)]
+    assert app.state.limiter.charged == [("key_test", 1_100, (1_000 * 2 + 100 * 10) / 1e6)]
 
 
 def test_charges_tokens_after_stream_ends():
     client, _ = make_client(stream_handler(SSE_EVENTS))
     with client.stream("POST", "/v1/messages", json={"model": "claude-sonnet-5-5", "stream": True}) as resp:
         resp.read()
-    assert app.state.limiter.charged == [("key_test", 1_100)]
+    assert app.state.limiter.charged == [("key_test", 1_100, (1_000 * 2 + 100 * 10) / 1e6)]

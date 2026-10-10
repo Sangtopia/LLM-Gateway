@@ -146,14 +146,23 @@ async def _cli(args: argparse.Namespace) -> None:
             print(f"\n    {plaintext}\n")
             print("Save this key now. It is stored hashed and can't be shown again.")
         elif args.command == "list":
+            from gateway.db import spend_since
+            from gateway.models import format_usd
+            from gateway.ratelimit import month_start
+
+            this_month = month_start(datetime.now(UTC))
             for k in await store.list():
+                spent = await spend_since(engine, k["id"], this_month)
                 status = "revoked" if k["revoked_at"] else "active"
-                limits = ", ".join(
-                    f"{label}={k[col]}"
-                    for label, col in [("rpm", "rpm_limit"), ("tpm", "tpm_limit"), ("budget $", "monthly_budget_usd")]
-                    if k[col] is not None
-                ) or "no limits"
-                print(f"{k['id']}  {k['key_prefix']}...  {k['name']:<24} {status:<8} {limits}")
+                limits = []
+                if k["rpm_limit"] is not None:
+                    limits.append(f"{k['rpm_limit']} req/min")
+                if k["tpm_limit"] is not None:
+                    limits.append(f"{k['tpm_limit']} tokens/min")
+                if k["monthly_budget_usd"] is not None:
+                    limits.append(f"{format_usd(k['monthly_budget_usd'])}/month")
+                limits = ", ".join(limits) or "no limits"
+                print(f"{k['id']}  {k['key_prefix']}...  {k['name']:<24} {status:<8} spent {format_usd(spent)} this month  {limits}")
         elif args.command == "revoke":
             print("Revoked." if await store.revoke(args.key_id) else "No active key with that id.")
     finally:
