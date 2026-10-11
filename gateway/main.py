@@ -1,13 +1,14 @@
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from gateway.circuit import CircuitBreaker
+from gateway import metrics
 from gateway.config import settings
 from gateway.db import RequestLogger, init_db, spend_since
 from gateway.keys import KeyStore
@@ -70,3 +71,8 @@ async def health() -> dict:
         "circuits": app.state.breaker.snapshot(),  # Models currently skipped or probing.
         "ttft_p50_ms": app.state.router.latency.snapshot(),  # Used by the "fastest" strategy.
     }
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    return Response(metrics.render(app.state.breaker), media_type="text/plain; version=0.0.4")

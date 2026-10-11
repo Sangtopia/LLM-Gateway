@@ -8,3 +8,4 @@ aiosqlite>=0.20
 redis>=5.2
 fakeredis[lua]>=2.26
 anthropic>=1.13
+prometheus-client>=0.21

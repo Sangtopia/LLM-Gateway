@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from gateway.circuit import CircuitBreaker, attempt_succeeded
 from gateway.config import settings
 from gateway.db import RequestLogger
+from gateway import metrics
 from gateway.keys import KeyStore, extract_key
 from gateway.models import cache_savings_usd, cost_usd
 from gateway.promptcache import apply_prompt_caching
@@ -90,6 +91,7 @@ def write_log(request_log: RequestLogger, record: dict) -> None:
     if isinstance(record.get("attempts"), list):
         record["attempts"] = [a.as_dict() if isinstance(a, Attempt) else a for a in record["attempts"]]
     request_log.write(record)
+    metrics.observe(record)
 
 
 API_ERROR_TYPES = {401: "authentication_error", 503: "overloaded_error", 504: "timeout_error"}
