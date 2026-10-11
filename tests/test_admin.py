@@ -119,3 +119,9 @@ def test_key_api_needs_the_admin_token_when_set(client, monkeypatch):
     monkeypatch.setattr(settings, "admin_token", "s3cret")
     assert c.post("/admin/keys", json={"name": "x"}).status_code == 401
     assert c.post("/admin/keys", json={"name": "x"}, headers={"x-admin-token": "s3cret"}).status_code == 201
+
+
+def test_root_redirects_to_the_dashboard(client):
+    c, _ = client
+    resp = c.get("/", follow_redirects=False)
+    assert resp.status_code == 307 and resp.headers["location"] == "/dashboard"

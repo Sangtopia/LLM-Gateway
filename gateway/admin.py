@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -57,6 +57,11 @@ def _percentile(values: list[float], p: float) -> float | None:
 
 def _rate(numerator: int, denominator: int) -> float | None:
     return numerator / denominator if denominator else None
+
+
+@router.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    return RedirectResponse("/dashboard")
 
 
 @router.get("/dashboard", response_class=HTMLResponse, include_in_schema=False)
