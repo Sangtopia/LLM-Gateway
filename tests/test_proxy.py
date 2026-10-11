@@ -56,6 +56,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.limiter = FakeLimiter()
     app.state.retry_policy = RetryPolicy(max_retries=2, base_delay_s=0, max_delay_s=0)
     app.state.fallback_chains = {"claude-sonnet-5-5": ["claude-sonnet-5", "claude-haiku-5-5"]}
+    app.state.refusal_fallbacks = {"claude-haiku-5-5": ["claude-sonnet-5-5"]}
     app.state.breaker = CircuitBreaker(failure_threshold=1_000)  # Effectively off; tested on its own.
     app.state.router = Router(DEFAULT_ALIASES, LatencyTracker())
     app.state.response_cache = ResponseCache(fakeredis.FakeAsyncRedis())
@@ -844,3 +845,47 @@ def test_exact_mode_never_matches_by_meaning():
     ask(client, "reset my password", **{"x-gateway-cache": "on"})
     resp = ask(client, "how do I reset my password", **{"x-gateway-cache": "on"})
     assert resp.headers["x-gateway-cache"] == "miss" and len(calls) == 2
+
+
+# --- Refusal fallback -----------------------------------------------------------------
+
+
+def refusing(model_that_refuses: str):
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        model = json.loads(req.content)["model"]
+        calls.append(model)
+        stop = "refusal" if model == model_that_refuses else "end_turn"
+        return httpx.Response(200, json={"model": model, "stop_reason": stop, "usage": USAGE, "content": []})
+
+    return handler, calls
+
+
+def test_haiku_refusal_is_retried_on_the_refusal_fallback_model():
+    handler, calls = refusing("claude-haiku-5-5")
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5", "messages": []})
+
+    assert resp.json()["stop_reason"] == "end_turn" and resp.json()["model"] == "claude-sonnet-5-5"
+    assert calls == ["claude-haiku-5-5", "claude-sonnet-5-5"]
+    [record] = log.records
+    assert record["refusal_fallback"] is True and record["served_model"] == "claude-sonnet-5-5"
+    haiku_cost = (1_000 * 0.10 + 100 * 0.50) / 1e6
+    sonnet_cost = (1_000 * 2 + 100 * 10) / 1e6
+    assert record["cost_usd"] == pytest.approx(haiku_cost + sonnet_cost)  # The declined call still costs.
+    assert record["attempts"][0]["error"] == "refusal"
+
+
+def test_refusal_from_a_model_without_a_refusal_fallback_is_returned_as_is():
+    handler, calls = refusing("claude-opus-5-5")
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-opus-5-5", "messages": []})
+    assert resp.json()["stop_reason"] == "refusal" and calls == ["claude-opus-5-5"]
+
+
+def test_refusal_fallback_respects_opt_out():
+    handler, calls = refusing("claude-haiku-5-5")
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"}, headers={"x-gateway-fallback": "off"})
+    assert resp.json()["stop_reason"] == "refusal" and calls == ["claude-haiku-5-5"]

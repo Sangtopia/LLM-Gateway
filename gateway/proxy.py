@@ -332,6 +332,22 @@ async def messages(request: Request) -> Response:
         return response
 
     upstream, served = result.response, result.served
+
+    # A declined non-streaming request from a model without Anthropic's server-side
+    # fallback: retry it on the configured model. The declined call still costs money.
+    refused_cost = 0.0
+    refusal_chain = request.app.state.refusal_fallbacks.get(served or "", []) if fallback_allowed else []
+    if not stream and upstream.status_code == 200 and refusal_chain:
+        refused = parse_json_object(upstream.content)
+        if refused.get("stop_reason") == "refusal":
+            refused_cost = cost_usd(served, refused.get("usage") or {}) or 0.0
+            call.attempts[-1].error = "refusal"
+            call.chain = refusal_chain
+            retry = await call.open()
+            if retry.response is not None and retry.response.status_code == 200:
+                upstream, served = retry.response, retry.served
+                record["refusal_fallback"] = True
+
     upstream_ms = elapsed_ms(started)  # Including retries and fallbacks. For streams: until headers arrive.
     record.update(
         status_code=upstream.status_code,
@@ -361,6 +377,8 @@ async def messages(request: Request) -> Response:
             record.update(outcome="ok", stop_reason=payload.get("stop_reason"))
             usage = payload.get("usage") or {}
             add_usage(record, payload.get("model") or model, usage)
+            if refused_cost:
+                record["cost_usd"] = (record["cost_usd"] or 0.0) + refused_cost
             limiter.record_usage(api_key, tokens_for_rate_limit(usage), record["cost_usd"])
         else:
             error_type = (payload.get("error") or {}).get("type") or f"http_{upstream.status_code}"

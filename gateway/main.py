@@ -30,6 +30,7 @@ async def lifespan(app: FastAPI):
     )
     app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)
     app.state.fallback_chains = settings.fallback_chains
+    app.state.refusal_fallbacks = settings.refusal_fallbacks
     app.state.breaker = CircuitBreaker(settings.circuit_failure_threshold, settings.circuit_cooldown_s)
     app.state.router = Router(settings.route_aliases, LatencyTracker())
     engine = create_async_engine(settings.database_url)

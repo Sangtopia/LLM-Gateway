@@ -65,6 +65,15 @@ DEFAULT_FALLBACKS: dict[str, list[str]] = {
 }
 
 
+# Where to retry a request a model declined (stop_reason "refusal"). Anthropic's
+# server-side fallback (the `fallbacks` parameter) covers Opus and Sonnet but not
+# Claude Haiku 5.5, so the gateway provides one. This steps up in price, but only
+# for requests the cheaper model refused.
+DEFAULT_REFUSAL_FALLBACKS: dict[str, list[str]] = {
+    "claude-haiku-5-5": ["claude-sonnet-5-5"],
+}
+
+
 def format_usd(amount: float) -> str:
     """Dollars for people: cents normally, more digits for sub-cent amounts."""
     if amount == 0 or abs(amount) >= 0.01:

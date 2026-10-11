@@ -1,7 +1,7 @@
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from gateway.models import DEFAULT_FALLBACKS
+from gateway.models import DEFAULT_FALLBACKS, DEFAULT_REFUSAL_FALLBACKS
 from gateway.routing import DEFAULT_ALIASES, Alias
 
 
@@ -25,6 +25,8 @@ class Settings(BaseSettings):
 
     # JSON in the environment, e.g. FALLBACK_CHAINS={"claude-sonnet-5-5": ["claude-haiku-5-5"]}
     fallback_chains: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_FALLBACKS))
+    # Retry declined (stop_reason "refusal") non-streaming requests on another model. JSON, like FALLBACK_CHAINS.
+    refusal_fallbacks: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_REFUSAL_FALLBACKS))
     # JSON, e.g. ROUTE_ALIASES={"cheap": {"strategy": "cheapest", "models": ["claude-haiku-5-5"]}}
     route_aliases: dict[str, Alias] = Field(default_factory=lambda: dict(DEFAULT_ALIASES))
 

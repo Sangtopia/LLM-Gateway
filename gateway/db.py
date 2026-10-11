@@ -56,6 +56,7 @@ requests_table = Table(
     Column("upstream_ms", Float),  # Time waiting for upstream response headers.
     Column("cache_hit", Boolean, nullable=False, default=False),
     Column("fallback_used", Boolean, nullable=False, default=False),
+    Column("refusal_fallback", Boolean),  # Served by another model after the first one declined.
     Column("upstream_request_id", String),
     Column("attempts", JSON),  # One entry per upstream try: model, status or error, timing, retry wait.
 )
