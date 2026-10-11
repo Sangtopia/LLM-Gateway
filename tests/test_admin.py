@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 from gateway.config import settings
 from gateway.db import api_keys_table, init_db, requests_table
+from gateway.keys import KeyStore
 from gateway.main import app
 
 NOW = datetime.now(UTC)
@@ -49,6 +50,7 @@ def client(tmp_path):
 
     engine = asyncio.run(setup())
     app.state.engine = engine
+    app.state.keys = KeyStore(engine)
     yield TestClient(app), rows
     asyncio.run(engine.dispose())
 
@@ -97,3 +99,22 @@ def test_dashboard_page_is_served(client):
     c, _ = client
     page = c.get("/dashboard")
     assert page.status_code == 200 and "Gateway Dashboard" in page.text
+
+
+def test_create_list_and_revoke_keys_over_the_api(client):
+    c, _ = client
+    created = c.post("/admin/keys", json={"name": "helpdesk", "rpm": 60, "monthly_budget_usd": 20}).json()
+    assert created["key"].startswith("gw-")
+    listed = {k["id"]: k for k in c.get("/admin/keys").json()}
+    assert listed[created["id"]]["rpm_limit"] == 60 and "key_hash" not in listed[created["id"]]
+    assert asyncio.run(app.state.keys.authenticate(created["key"])) is not None
+    assert c.delete(f"/admin/keys/{created['id']}").json() == {"revoked": created["id"]}
+    assert c.delete(f"/admin/keys/{created['id']}").status_code == 404
+    assert c.post("/admin/keys", json={"name": ""}).status_code == 422
+
+
+def test_key_api_needs_the_admin_token_when_set(client, monkeypatch):
+    c, _ = client
+    monkeypatch.setattr(settings, "admin_token", "s3cret")
+    assert c.post("/admin/keys", json={"name": "x"}).status_code == 401
+    assert c.post("/admin/keys", json={"name": "x"}, headers={"x-admin-token": "s3cret"}).status_code == 201

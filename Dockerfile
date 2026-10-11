@@ -10,5 +10,6 @@ COPY gateway ./gateway
 
 EXPOSE 8000
 # One worker process: the circuit breaker and latency tracker are per process, which is
-# fine, but run more containers rather than more workers to scale out.
-CMD ["uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
+# fine, but run more containers rather than more workers to scale out. PORT is set by
+# hosts like Render; locally it defaults to 8000.
+CMD ["sh", "-c", "exec uvicorn gateway.main:app --host 0.0.0.0 --port ${PORT:-8000} --proxy-headers --forwarded-allow-ips '*'"]

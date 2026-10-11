@@ -1,4 +1,4 @@
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from gateway.models import DEFAULT_FALLBACKS, DEFAULT_REFUSAL_FALLBACKS
@@ -33,6 +33,16 @@ class Settings(BaseSettings):
     refusal_fallbacks: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_REFUSAL_FALLBACKS))
     # JSON, e.g. ROUTE_ALIASES={"cheap": {"strategy": "cheapest", "models": ["claude-haiku-5-5"]}}
     route_aliases: dict[str, Alias] = Field(default_factory=lambda: dict(DEFAULT_ALIASES))
+
+
+    @field_validator("database_url")
+    @classmethod
+    def _async_driver(cls, url: str) -> str:
+        """Hosts like Render hand out postgres:// or postgresql:// URLs; the gateway needs the async driver."""
+        for prefix in ("postgres://", "postgresql://"):
+            if url.startswith(prefix):
+                return "postgresql+asyncpg://" + url[len(prefix):]
+        return url
 
 
 settings = Settings()

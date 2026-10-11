@@ -230,6 +230,20 @@ python -m bench.chaos              # take a model down mid-run
 python -m bench.semantic_eval ../Ai-Help-Desk/evals/cases.json
 ```
 
+### Deploying to Render
+
+`render.yaml` is a Render Blueprint: the gateway as a Docker web service, its request log in a free Render Postgres database, and Redis from Redis Cloud.
+
+1. In Render, choose **New → Blueprint**, pick this repo, and enter `ANTHROPIC_API_KEY` and `REDIS_URL` when asked.
+2. Copy the generated `ADMIN_TOKEN` from the service's Environment tab.
+3. Create keys over the admin API, since Render's free tier has no shell:
+
+```bash
+curl -X POST https://<your-service>.onrender.com/admin/keys   -H "x-admin-token: $ADMIN_TOKEN" -H "content-type: application/json"   -d '{"name": "my-app", "rpm": 60, "monthly_budget_usd": 20}'
+```
+
+Free web services sleep after 15 minutes without traffic, so the first request after a pause takes about a minute.
+
 ## Using it from an app
 
 Apps use the official Anthropic SDK with `base_url` and a `gw-` key. Optional request headers:

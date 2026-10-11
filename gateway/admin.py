@@ -12,11 +12,13 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from gateway.config import settings
 from gateway.db import api_keys_table, requests_table
+from gateway.keys import KeyStore
 
 router = APIRouter()
 
@@ -195,3 +197,43 @@ async def request_trace(request: Request, request_id: str) -> dict:
     row = dict(row)
     row["created_at"] = _as_utc(row["created_at"]).isoformat(timespec="seconds")
     return row
+
+
+# ---------- key management (for hosts without a shell, like Render's free tier) ----------
+
+class NewKey(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    rpm: int | None = Field(default=None, gt=0)
+    tpm: int | None = Field(default=None, gt=0)
+    monthly_budget_usd: float | None = Field(default=None, gt=0)
+
+
+def _keys(request: Request) -> KeyStore:
+    return request.app.state.keys
+
+
+@router.post("/admin/keys", status_code=201)
+async def create_key(request: Request, body: NewKey) -> dict:
+    """Create a gateway key. The plaintext key is in this response only; it's stored hashed."""
+    require_admin(request)
+    key, plaintext = await _keys(request).create(body.name, body.rpm, body.tpm, body.monthly_budget_usd)
+    return {"id": key.id, "name": key.name, "key": plaintext}
+
+
+@router.get("/admin/keys")
+async def list_keys(request: Request) -> list[dict]:
+    require_admin(request)
+    keys = await _keys(request).list()
+    for k in keys:
+        for field in ("created_at", "revoked_at"):
+            if k[field] is not None:
+                k[field] = _as_utc(k[field]).isoformat(timespec="seconds")
+    return keys
+
+
+@router.delete("/admin/keys/{key_id}")
+async def revoke_key(request: Request, key_id: str) -> dict:
+    require_admin(request)
+    if not await _keys(request).revoke(key_id):
+        raise HTTPException(404, "No active key with that id.")
+    return {"revoked": key_id}

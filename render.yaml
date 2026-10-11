@@ -1,0 +1,30 @@
+# Render Blueprint: https://render.com/docs/blueprint-spec
+# The gateway as a Docker web service, its request log in Render Postgres, and rate limits,
+# budgets and caches in the existing Redis Cloud database (us-east-1, so the service runs in
+# Virginia to keep that round trip short).
+services:
+  - type: web
+    name: llm-gateway
+    runtime: docker
+    plan: free
+    region: virginia
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false  # Render asks for it when you create the Blueprint; it is never stored in the repo
+      - key: REDIS_URL
+        sync: false  # redis://default:<password>@<host>:<port> from Redis Cloud
+      - key: ADMIN_TOKEN
+        generateValue: true  # For /dashboard and /admin; copy it from the service's Environment tab
+      - key: DATABASE_URL
+        fromDatabase:
+          name: llm-gateway-db
+          property: connectionString
+
+databases:
+  - name: llm-gateway-db
+    plan: free
+    region: virginia
+    databaseName: gateway
+    user: gateway
