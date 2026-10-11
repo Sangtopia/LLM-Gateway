@@ -20,6 +20,7 @@ Beyond that:
 - One process handled 1,224 requests per second at 400 concurrent requests with no errors.
 - All 9,575 of 9,575 requests succeeded while the primary model was down under load.
 - Retries, fallbacks and stream recovery are tested with fault injection.
+- The live [Ai-Help-Desk demo](https://ai-help-desk-r8wy.onrender.com) sends every Claude call through this gateway, deployed on Render with Postgres and Redis.
 
 ---
 
