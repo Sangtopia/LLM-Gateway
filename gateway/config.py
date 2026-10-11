@@ -6,7 +6,8 @@ from gateway.routing import DEFAULT_ALIASES, Alias
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    # hide_input_in_errors: settings hold secrets, and a validation error would otherwise print them.
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
 
     anthropic_api_key: str = ""
     anthropic_base_url: str = "https://api.anthropic.com"
@@ -34,6 +35,16 @@ class Settings(BaseSettings):
     # JSON, e.g. ROUTE_ALIASES={"cheap": {"strategy": "cheapest", "models": ["claude-haiku-5-5"]}}
     route_aliases: dict[str, Alias] = Field(default_factory=lambda: dict(DEFAULT_ALIASES))
 
+
+    @field_validator("redis_url")
+    @classmethod
+    def _clean_redis_url(cls, url: str) -> str:
+        """Tolerate stray whitespace or quotes from copy-paste; fail clearly (without echoing the
+        password) if the value isn't a Redis URL, e.g. when copied with `redis-cli -u` in front."""
+        url = url.strip().strip("'\"").strip()
+        if not url.startswith(("redis://", "rediss://", "unix://")):
+            raise ValueError("REDIS_URL must start with redis:// or rediss://")
+        return url
 
     @field_validator("database_url")
     @classmethod
