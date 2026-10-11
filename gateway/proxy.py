@@ -15,6 +15,7 @@ from gateway.keys import KeyStore, extract_key
 from gateway.models import cost_usd
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
 from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
+from gateway.routing import Router
 from gateway.sse import StreamTracker
 
 router = APIRouter()
@@ -246,9 +247,18 @@ async def messages(request: Request) -> Response:
         # For streams the read timeout is the longest allowed gap between events.
         timeout = httpx.Timeout(settings.upstream_stream_idle_timeout_s, connect=settings.upstream_connect_timeout_s)
 
-    chain = [model]
-    if model and request.headers.get("x-gateway-fallback", "").lower() != "off":
-        chain += request.app.state.fallback_chains.get(model, [])
+    fallback_allowed = request.headers.get("x-gateway-fallback", "").lower() != "off"
+    router: Router = request.app.state.router
+    route = router.resolve(model, parsed, len(body))
+    if route is not None:
+        # An alias: the strategy's ranking is the chain, best first.
+        chain: list[str | None] = route.models if fallback_allowed else route.models[:1]
+        record["route"] = f"{route.alias}:{route.strategy}"
+    else:
+        chain = [model]
+        if model and fallback_allowed:
+            chain += request.app.state.fallback_chains.get(model, [])
+    primary = chain[0]  # The model a fallback is measured against.
     call = UpstreamCall(
         http=request.app.state.http,
         headers=headers,
@@ -263,6 +273,7 @@ async def messages(request: Request) -> Response:
     )
     record["attempts"] = call.attempts
 
+    upstream_started = time.perf_counter()
     result = await call.open()
     if result.response is None:
         response = fail(record, request_log, started, result.status, result.error_type, result.message)
@@ -277,13 +288,15 @@ async def messages(request: Request) -> Response:
         upstream_ms=upstream_ms,
         upstream_request_id=upstream.headers.get("request-id"),
         served_model=served,
-        fallback_used=served is not None and served != model,
+        fallback_used=served is not None and served != primary,
     )
     response_headers = client_headers(upstream)
     response_headers["x-gateway-upstream-ms"] = f"{upstream_ms:.1f}"
     response_headers["x-gateway-attempts"] = str(len(call.attempts))
     if served:
         response_headers["x-gateway-model"] = served
+    if route is not None:
+        response_headers["x-gateway-route"] = record["route"]
 
     # Errors arrive as a plain JSON body even when streaming was requested,
     # so read them fully and return them like a normal response.
@@ -337,6 +350,10 @@ async def messages(request: Request) -> Response:
                         held.append(chunk)
                         if tracker.saw_content or tracker.completed:
                             record["ttft_ms"] = elapsed_ms(started)
+                            if served and len(call.attempts) == 1:
+                                # A clean sample (no retries or fallbacks) of this model's
+                                # speed, timed from the upstream call, for "fastest" routing.
+                                router.latency.record(served, elapsed_ms(upstream_started))
                             released = True
                             yield b"".join(held)
                             held = []
@@ -387,7 +404,7 @@ async def messages(request: Request) -> Response:
                 upstream, served = retry.response, retry.served
                 record.update(
                     served_model=served,
-                    fallback_used=served != model,
+                    fallback_used=served != primary,
                     upstream_request_id=upstream.headers.get("request-id"),
                 )
         finally:

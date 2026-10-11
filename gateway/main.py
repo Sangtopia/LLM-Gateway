@@ -14,6 +14,7 @@ from gateway.keys import KeyStore
 from gateway.proxy import router
 from gateway.ratelimit import RateLimiter
 from gateway.retry import RetryPolicy
+from gateway.routing import LatencyTracker, Router
 
 
 @asynccontextmanager
@@ -26,6 +27,7 @@ async def lifespan(app: FastAPI):
     app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)
     app.state.fallback_chains = settings.fallback_chains
     app.state.breaker = CircuitBreaker(settings.circuit_failure_threshold, settings.circuit_cooldown_s)
+    app.state.router = Router(settings.route_aliases, LatencyTracker())
     engine = create_async_engine(settings.database_url)
     await init_db(engine)
     app.state.keys = KeyStore(engine)
@@ -63,4 +65,5 @@ async def health() -> dict:
         "status": "ok",
         "upstream_key_configured": bool(settings.anthropic_api_key),
         "circuits": app.state.breaker.snapshot(),  # Models currently skipped or probing.
+        "ttft_p50_ms": app.state.router.latency.snapshot(),  # Used by the "fastest" strategy.
     }

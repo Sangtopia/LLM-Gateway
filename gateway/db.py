@@ -34,6 +34,7 @@ requests_table = Table(
     Column("api_key_id", String, index=True),  # None when the request had no valid key.
     Column("model", String, index=True),  # As requested by the app.
     Column("served_model", String, index=True),  # The model that answered (differs after a fallback).
+    Column("route", String),  # "alias:strategy" when the app asked for an alias like "fast".
     Column("provider", String, nullable=False),
     Column("stream", Boolean, nullable=False),
     Column("status_code", Integer, nullable=False),

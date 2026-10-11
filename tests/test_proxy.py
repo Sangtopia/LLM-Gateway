@@ -10,6 +10,7 @@ from gateway.keys import ApiKey
 from gateway.main import app
 from gateway.ratelimit import ALLOW, Decision
 from gateway.retry import RetryPolicy
+from gateway.routing import DEFAULT_ALIASES, LatencyTracker, Router
 
 TEST_KEY = "gw-test-key"
 
@@ -48,6 +49,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.retry_policy = RetryPolicy(max_retries=2, base_delay_s=0, max_delay_s=0)
     app.state.fallback_chains = {"claude-sonnet-5-5": ["claude-sonnet-5", "claude-haiku-5-5"]}
     app.state.breaker = CircuitBreaker(failure_threshold=1_000)  # Effectively off; tested on its own.
+    app.state.router = Router(DEFAULT_ALIASES, LatencyTracker())
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -599,3 +601,52 @@ def test_opening_events_are_held_until_first_content():
     status, body = stream_request(client)
 
     assert body == b"".join(SSE_EVENTS)  # Nothing lost or reordered by holding.
+
+
+# --- Aliases -------------------------------------------------------------------
+
+
+def test_alias_routes_to_ranked_model_and_logs_route():
+    handler, seen = by_model({})
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "cheap", "max_tokens": 100})
+
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "claude-haiku-5-5"
+    assert resp.headers["x-gateway-route"] == "cheap:cheapest"
+    assert seen == ["claude-haiku-5-5"]
+    [record] = log.records
+    assert record["model"] == "cheap"
+    assert record["served_model"] == "claude-haiku-5-5"
+    assert record["route"] == "cheap:cheapest"
+    assert record["fallback_used"] is False
+    assert record["cost_usd"] == (1_000 * 0.10 + 100 * 0.50) / 1e6  # Priced as Haiku 5.5.
+
+
+def test_alias_falls_back_through_its_ranking():
+    handler, seen = by_model({"claude-haiku-5-5": 529})
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "cheap", "max_tokens": 100})
+
+    assert resp.json()["model"] == "claude-sonnet-5"  # Next cheapest.
+    assert log.records[0]["fallback_used"] is True
+
+
+def test_alias_with_fallback_off_uses_only_the_top_pick():
+    handler, seen = by_model({"claude-haiku-5-5": 529})
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages", json={"model": "cheap"}, headers={"x-gateway-fallback": "off"})
+
+    assert resp.status_code == 529
+    assert set(seen) == {"claude-haiku-5-5"}
+
+
+def test_streams_feed_the_latency_tracker_for_fastest_routing():
+    handler, _ = by_model({})
+    client, _ = make_client(handler)
+    for _ in range(3):
+        with client.stream("POST", "/v1/messages", json={"model": "fast", "stream": True}) as resp:
+            resp.read()
+
+    latency = app.state.router.latency
+    assert len(latency._samples["claude-haiku-5-5"]) == 3
