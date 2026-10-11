@@ -21,16 +21,21 @@ scope is a capped Redis list of (embedding, response) entries; a lookup reads th
 list and compares in numpy, which is fast at this size and needs no vector index.
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import hashlib
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
-import numpy as np
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+
+if TYPE_CHECKING:
+    import numpy as np
 
 log = logging.getLogger(__name__)
 
@@ -49,8 +54,10 @@ class Embedder:
         self._model = None
 
     def _embed_sync(self, text: str) -> np.ndarray:
+        import numpy as np  # Optional dependencies (requirements-dev.txt): only the semantic cache needs them.
+
         if self._model is None:
-            from fastembed import TextEmbedding  # Optional dependency; only needed for semantic caching.
+            from fastembed import TextEmbedding
 
             self._model = TextEmbedding(self.model_name)
         vector = np.asarray(next(iter(self._model.embed([text]))), dtype=np.float32)
@@ -111,6 +118,8 @@ class SemanticCache:
             return None
         if not raw:
             return None
+        import numpy as np
+
         entries = [json.loads(r) for r in raw]
         matrix = np.stack([np.frombuffer(base64.b64decode(e["v"]), dtype=np.float32) for e in entries])
         similarities = matrix @ vector
@@ -122,6 +131,8 @@ class SemanticCache:
                     cost_usd: float | None, ttl_s: int) -> None:
         if len(body) > MAX_ENTRY_BYTES or time.monotonic() < self._down_until:
             return
+        import numpy as np
+
         entry = {
             "v": base64.b64encode(vector.astype(np.float32).tobytes()).decode(),
             "body": body.decode("utf-8"), "content_type": content_type, "model": model, "cost_usd": cost_usd,
