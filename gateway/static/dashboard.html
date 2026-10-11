@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gateway Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11, 11, 11, 0.10);
+    --hover: rgba(11, 11, 11, 0.04);
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+    --series-other: #898781;
+    --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) {
+      color-scheme: dark;
+      --page: #0d0d0d; --surface-1: #1a1a19;
+      --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+      --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --hover: rgba(255, 255, 255, 0.05);
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+      --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19;
+    --text-primary: #ffffff; --text-secondary: #c3c2b7; --text-muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --hover: rgba(255, 255, 255, 0.05);
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--page); color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1280px; margin: 0 auto; padding: 24px 16px 48px; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; justify-content: space-between; }
+  h1 { font-size: 20px; margin: 0; font-weight: 600; }
+  h2 { font-size: 14px; font-weight: 600; margin: 0 0 2px; }
+  .sub { color: var(--text-secondary); font-size: 12px; margin: 0 0 12px; }
+  .filters { display: flex; gap: 4px; align-items: center; }
+  .filters button, .theme {
+    font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; cursor: pointer;
+  }
+  .filters button[aria-pressed="true"] { font-weight: 700; border-color: var(--text-secondary); }
+  .filters button:hover, .theme:hover { background: var(--hover); }
+  .status-line { color: var(--text-muted); font-size: 12px; margin: 8px 0 16px; min-height: 18px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile, .card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; }
+  .tile { padding: 12px 14px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+  .tile .note { color: var(--text-muted); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 16px; margin-bottom: 16px; }
+  .card { padding: 14px 16px 12px; min-width: 0; }
+  .chart-box { position: relative; height: 260px; }
+  .empty { color: var(--text-muted); font-size: 13px; padding: 40px 0; text-align: center; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th { color: var(--text-secondary); font-weight: 600; }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover, tbody tr.selected { background: var(--hover); }
+  .table-wrap { overflow-x: auto; }
+  .pill { display: inline-flex; gap: 4px; align-items: center; color: var(--text-primary); }
+  .pill::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--dot); }
+  .ok { --dot: var(--good); } .warn { --dot: var(--warning); } .bad { --dot: var(--critical); } .skip { --dot: var(--text-muted); }
+  .trace { display: none; }
+  .trace.open { display: block; }
+  .trace dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 8px 0 12px; font-size: 13px; }
+  .trace dt { color: var(--text-secondary); }
+  .trace dd { margin: 0; overflow-wrap: anywhere; }
+  .steps { list-style: none; margin: 0; padding: 0; }
+  .steps li { display: grid; grid-template-columns: 28px 1fr auto; gap: 8px; padding: 8px 0; border-top: 1px solid var(--grid); align-items: baseline; }
+  .steps .n { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+  .steps .meta { color: var(--text-secondary); font-size: 12px; }
+  .close { float: right; }
+  .error { color: var(--critical); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>LLM Gateway</h1>
+    <div class="filters" role="group" aria-label="Time range">
+      <button data-hours="1">1h</button>
+      <button data-hours="24">24h</button>
+      <button data-hours="168">7d</button>
+      <button data-hours="720">30d</button>
+      <button class="theme" id="theme" title="Toggle light and dark">Theme</button>
+    </div>
+  </header>
+  <div class="status-line" id="status" aria-live="polite">Loading…</div>
+
+  <section class="tiles" id="tiles" aria-label="Summary"></section>
+
+  <section class="grid">
+    <div class="card">
+      <h2>Spend by day</h2>
+      <p class="sub">US dollars, stacked by the model that served each request</p>
+      <div class="chart-box"><canvas id="spendDay" role="img" aria-label="Spend by day and model"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Spend by gateway key</h2>
+      <p class="sub">US dollars in the selected range</p>
+      <div class="chart-box"><canvas id="spendKey" role="img" aria-label="Spend by gateway key"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Latency</h2>
+      <p class="sub">Successful requests, request arrival to last byte, seconds</p>
+      <div class="chart-box"><canvas id="latency" role="img" aria-label="p50 and p95 latency over time"></canvas></div>
+    </div>
+    <div class="card">
+      <h2>Error, fallback and cache hit rates</h2>
+      <p class="sub">Share of requests that got past auth and limits</p>
+      <div class="chart-box"><canvas id="rates" role="img" aria-label="Error, fallback and cache hit rates over time"></canvas></div>
+    </div>
+  </section>
+
+  <section class="card trace" id="trace" aria-live="polite"></section>
+
+  <section class="card" style="margin-top:16px">
+    <h2>Recent requests</h2>
+    <p class="sub">Newest first. Select a row to see its trace: every upstream attempt, retry and fallback.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr>
+          <th>Time (UTC)</th><th>Key</th><th>Requested</th><th>Served by</th><th>Result</th>
+          <th class="num">Tries</th><th class="num">Tokens in / out</th><th class="num">Cost</th><th class="num">Latency</th>
+        </tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script>
+(() => {
+  const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const store = {
+    get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+    set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage unavailable */ } },
+  };
+
+  // Admin token: ?token=... once, remembered in this browser.
+  const params = new URLSearchParams(location.search);
+  if (params.get("token")) { store.set("gw-admin-token", params.get("token")); history.replaceState(null, "", location.pathname); }
+  const headers = () => { const t = store.get("gw-admin-token"); return t ? { "x-admin-token": t } : {}; };
+
+  // Theme toggle wins over the OS setting both ways.
+  const themeButton = document.getElementById("theme");
+  const savedTheme = store.get("gw-theme");
+  if (savedTheme) document.documentElement.dataset.theme = savedTheme;
+  themeButton.addEventListener("click", () => {
+    const dark = document.documentElement.dataset.theme
+      ? document.documentElement.dataset.theme === "dark"
+      : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.dataset.theme = dark ? "light" : "dark";
+    store.set("gw-theme", document.documentElement.dataset.theme);
+    render();
+  });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", render);
+
+  // Color follows the model, never its rank: a fixed slot per known model.
+  const MODEL_ORDER = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1",
+                       "claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5"];
+  const slot = (m) => { const i = MODEL_ORDER.indexOf(m); return i >= 0 ? i : MODEL_ORDER.length; };
+  const modelColor = (m) => css(slot(m) < MODEL_ORDER.length ? `--series-${slot(m) + 1}` : "--series-other");
+  const short = (m) => (m || "-").replace(/^claude-/, "");
+
+  const usd = (v) => v == null ? "-" : v === 0 ? "$0" : Math.abs(v) >= 1 ? `$${v.toFixed(2)}` : Math.abs(v) >= 0.01 ? `$${v.toFixed(3)}` : `$${v.toPrecision(2)}`;
+  const pct = (v) => v == null ? "-" : `${(v * 100).toFixed(v < 0.1 ? 1 : 0)}%`;
+  const secs = (ms) => ms == null ? "-" : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+  let hours = Number(store.get("gw-hours")) || 24;
+  let data = null, recent = [], charts = {};
+
+  document.querySelectorAll(".filters [data-hours]").forEach((b) => {
+    b.addEventListener("click", () => { hours = Number(b.dataset.hours); store.set("gw-hours", hours); load(); });
+  });
+
+  async function getJSON(url) {
+    const r = await fetch(url, { headers: headers() });
+    if (!r.ok) throw new Error(r.status === 401 ? "Admin token required: open /dashboard?token=YOUR_ADMIN_TOKEN" : `${url}: HTTP ${r.status}`);
+    return r.json();
+  }
+
+  async function load() {
+    document.querySelectorAll(".filters [data-hours]").forEach((b) => b.setAttribute("aria-pressed", String(Number(b.dataset.hours) === hours)));
+    try {
+      [data, recent] = await Promise.all([getJSON(`/admin/stats?hours=${hours}`), getJSON("/admin/requests?limit=100")]);
+      document.getElementById("status").textContent =
+        `Updated ${new Date(data.generated_at).toLocaleTimeString()} · refreshes every 30 s` + (data.truncated ? " · showing the newest 50,000 requests" : "");
+      render();
+    } catch (e) {
+      document.getElementById("status").innerHTML = `<span class="error">${esc(e.message)}</span>`;
+    }
+  }
+
+  function tiles() {
+    const k = data.kpis;
+    const items = [
+      ["Requests", k.requests.toLocaleString(), k.rejected ? `${k.rejected.toLocaleString()} turned away by auth or limits` : "none turned away"],
+      ["Spend", usd(k.spend_usd), "priced as the model that served each request"],
+      ["p95 latency", secs(k.p95_latency_ms), `p50 ${secs(k.p50_latency_ms)}`],
+      ["Error rate", pct(k.error_rate), "after retries and fallbacks"],
+      ["Fallback rate", pct(k.fallback_rate), "served by a model other than the first choice"],
+      ["Cache savings", usd(k.prompt_cache_savings_usd + k.response_cache_savings_usd),
+        `prompt ${usd(k.prompt_cache_savings_usd)} · response ${usd(k.response_cache_savings_usd)}`],
+    ];
+    document.getElementById("tiles").innerHTML = items.map(([label, value, note]) =>
+      `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div><div class="note">${esc(note)}</div></div>`).join("");
+  }
+
+  function baseOptions(yFormat, extra = {}) {
+    const ink = css("--text-secondary"), muted = css("--text-muted"), grid = css("--grid");
+    return {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: "index", intersect: false },
+      plugins: {
+        legend: { position: "bottom", labels: { color: ink, boxWidth: 10, boxHeight: 10, usePointStyle: true } },
+        tooltip: { callbacks: { label: (c) => `${c.dataset.label}: ${yFormat(c.parsed.y ?? c.parsed.x)}` } },
+      },
+      scales: {
+        x: { ticks: { color: muted, maxRotation: 0, autoSkipPadding: 12 }, grid: { display: false }, border: { color: css("--axis") } },
+        y: { beginAtZero: true, ticks: { color: muted, callback: (v) => yFormat(v) }, grid: { color: grid }, border: { display: false } },
+      },
+      ...extra,
+    };
+  }
+
+  function chart(id, config) {
+    charts[id]?.destroy();
+    const canvas = document.getElementById(id);
+    const box = canvas.parentElement;
+    box.querySelector(".empty")?.remove();
+    // Zero is data (a 0% error rate); only a range with no values at all is empty.
+    const hasData = config.data.datasets.some((d) => d.data.some((v) => v != null));
+    canvas.style.display = hasData ? "" : "none";
+    if (!hasData) { box.insertAdjacentHTML("beforeend", `<div class="empty">No data in this range yet.</div>`); return; }
+    charts[id] = new Chart(canvas, config);
+  }
+
+  const label = (b) => data.series.granularity === "hour" ? b.slice(11, 16) : b.slice(5);
+
+  function render() {
+    if (!data) return;
+    tiles();
+    const surface = css("--surface-1");
+
+    const sd = data.spend_by_day;
+    chart("spendDay", {
+      type: "bar",
+      data: {
+        labels: sd.days.map((d) => d.slice(5)),
+        datasets: [...sd.models].sort((a, b) => slot(a) - slot(b))
+          .map((m) => ({ label: short(m), data: sd.values[m], backgroundColor: modelColor(m),
+                         borderColor: surface, borderWidth: 2, borderRadius: 4, borderSkipped: "bottom", maxBarThickness: 36 })),
+      },
+      options: (() => {
+        const o = baseOptions(usd);
+        o.scales.x.stacked = true;
+        o.scales.y.stacked = true;
+        return o;
+      })(),
+    });
+
+    chart("spendKey", {
+      type: "bar",
+      data: {
+        labels: data.spend_by_key.map((k) => k.name),
+        datasets: [{ label: "Spend", data: data.spend_by_key.map((k) => k.spend_usd), backgroundColor: css("--series-1"),
+                     borderRadius: 4, borderSkipped: "start", maxBarThickness: 22 }],
+      },
+      options: (() => {
+        // Horizontal bars: the value axis is x, the key names run down y.
+        const o = baseOptions(usd, { indexAxis: "y" });
+        const value = o.scales.y, category = o.scales.x;
+        o.scales = { x: value, y: { ...category, ticks: { color: css("--text-secondary") } } };
+        o.plugins.legend.display = false;
+        o.plugins.tooltip.callbacks.label = (c) => usd(c.parsed.x);
+        o.interaction = { mode: "nearest", axis: "y", intersect: false };
+        return o;
+      })(),
+    });
+
+    const s = data.series;
+    const line = (name, values, slot) => ({ label: name, data: values, borderColor: css(`--series-${slot}`),
+      backgroundColor: css(`--series-${slot}`), borderWidth: 2, pointRadius: values.length > 30 ? 0 : 3, pointHoverRadius: 5,
+      spanGaps: false, tension: 0 });  // No traffic in an hour is a gap, not a straight line.
+    const toSec = (v) => v == null ? null : v / 1000;
+    chart("latency", {
+      type: "line",
+      data: { labels: s.buckets.map(label), datasets: [line("p50", s.p50_latency_ms.map(toSec), 1), line("p95", s.p95_latency_ms.map(toSec), 2)] },
+      options: baseOptions((v) => `${Number(v).toFixed(1)} s`),
+    });
+    chart("rates", {
+      type: "line",
+      data: { labels: s.buckets.map(label), datasets: [
+        line("Errors", s.error_rate, 1), line("Fallbacks", s.fallback_rate, 2), line("Cache hits", s.cache_hit_rate, 3)] },
+      options: baseOptions(pct),
+    });
+
+    renderRows();
+  }
+
+  function resultPill(r) {
+    if (r.cache_hit) return `<span class="pill ok">cache hit</span>`;
+    if (r.outcome === "ok") return `<span class="pill ok">${r.status_code} ok</span>`;
+    if (r.outcome === "incomplete") return `<span class="pill warn">incomplete</span>`;
+    return `<span class="pill bad">${r.status_code} ${esc(r.error_type || "error")}</span>`;
+  }
+
+  let selected = null;
+  function renderRows() {
+    document.getElementById("rows").innerHTML = recent.map((r) => `
+      <tr data-id="${r.id}" class="${r.id === selected ? "selected" : ""}" tabindex="0">
+        <td>${r.created_at.slice(5, 19).replace("T", " ")}</td>
+        <td>${esc(data.key_names[r.api_key_id] || r.api_key_id || "-")}</td>
+        <td>${esc(short(r.model))}${r.route ? ` <span class="meta">(${esc(r.route)})</span>` : ""}</td>
+        <td>${esc(short(r.served_model))}${r.fallback_used ? " · fallback" : ""}</td>
+        <td>${resultPill(r)}</td>
+        <td class="num">${r.tries}</td>
+        <td class="num">${r.input_tokens ?? "-"} / ${r.output_tokens ?? "-"}</td>
+        <td class="num">${usd(r.cost_usd)}</td>
+        <td class="num">${secs(r.latency_ms)}</td>
+      </tr>`).join("");
+    document.querySelectorAll("#rows tr").forEach((tr) => {
+      const open = () => showTrace(tr.dataset.id);
+      tr.addEventListener("click", open);
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter") open(); });
+    });
+  }
+
+  async function showTrace(id) {
+    selected = id;
+    document.querySelectorAll("#rows tr").forEach((tr) => tr.classList.toggle("selected", tr.dataset.id === id));
+    const box = document.getElementById("trace");
+    try {
+      const t = await getJSON(`/admin/requests/${id}`);
+      const attempts = t.attempts || [];
+      const step = (a, i) => {
+        let cls = "ok", what = `HTTP ${a.status}`;
+        if (a.error === "circuit_open") { cls = "skip"; what = "skipped: circuit open"; }
+        else if (a.error?.startsWith("stream:")) { cls = "bad"; what = `stream failed: ${a.error.slice(7)}`; }
+        else if (a.error) { cls = "bad"; what = a.error; }
+        else if (a.status >= 400) { cls = a.status === 429 || a.status >= 500 ? "warn" : "bad"; }
+        const wait = a.retry_delay_ms != null ? ` · then waited ${secs(a.retry_delay_ms)} before retrying` : "";
+        return `<li><span class="n">${i + 1}</span><span><b>${esc(short(a.model))}</b> <span class="pill ${cls}">${esc(what)}</span>
+                <div class="meta">${a.ms != null ? `took ${secs(a.ms)}` : ""}${wait}</div></span><span></span></li>`;
+      };
+      box.innerHTML = `
+        <button class="theme close" id="closeTrace">Close</button>
+        <h2>Trace ${esc(t.id.slice(0, 8))}</h2>
+        <p class="sub">${esc(t.created_at)} · key ${esc(data.key_names[t.api_key_id] || t.api_key_id || "-")}</p>
+        <dl>
+          <dt>Requested</dt><dd>${esc(t.model)}${t.route ? ` (alias ${esc(t.route)})` : ""}</dd>
+          <dt>Served by</dt><dd>${esc(t.served_model || "-")}${t.fallback_used ? " (fallback)" : ""}${t.cache_hit ? " (response cache)" : ""}</dd>
+          <dt>Result</dt><dd>${resultPill(t)}${t.stop_reason ? ` · stop: ${esc(t.stop_reason)}` : ""}</dd>
+          <dt>Tokens</dt><dd>${t.input_tokens ?? 0} in · ${t.output_tokens ?? 0} out · ${t.cache_read_tokens ?? 0} cache read · ${t.cache_write_tokens ?? 0} cache write</dd>
+          <dt>Cost</dt><dd>${usd(t.cost_usd)}${t.prompt_cache_savings_usd ? ` · prompt caching saved ${usd(t.prompt_cache_savings_usd)}` : ""}${t.response_cache_saved_usd ? ` · response cache saved ${usd(t.response_cache_saved_usd)}` : ""}</dd>
+          <dt>Timing</dt><dd>total ${secs(t.latency_ms)}${t.ttft_ms != null ? ` · first token ${secs(t.ttft_ms)}` : ""}${t.upstream_ms != null ? ` · upstream headers ${secs(t.upstream_ms)}` : ""}</dd>
+        </dl>
+        <h2>Upstream attempts</h2>
+        ${attempts.length ? `<ol class="steps">${attempts.map(step).join("")}</ol>` : `<p class="sub">None: answered without calling Anthropic.</p>`}`;
+      box.classList.add("open");
+      document.getElementById("closeTrace").addEventListener("click", () => { box.classList.remove("open"); selected = null; renderRows(); });
+      box.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    } catch (e) {
+      box.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+      box.classList.add("open");
+    }
+  }
+
+  load();
+  setInterval(load, 30_000);
+})();
+</script>
+</body>
+</html>
