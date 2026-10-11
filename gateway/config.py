@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     upstream_read_timeout_s: float = 600.0  # Whole response, non-streaming. Long generations take minutes.
     upstream_stream_idle_timeout_s: float = 60.0  # Max gap between stream events; Anthropic sends pings.
     upstream_max_retries: int = 2
+    # Connections to Anthropic. httpx's default keeps only 20 idle, so above 20 concurrent
+    # requests connections are constantly closed and reopened.
+    upstream_max_connections: int = 500
+    upstream_max_keepalive: int = 200
     circuit_failure_threshold: int = 5  # Consecutive failed attempts before a model is skipped.
     circuit_cooldown_s: float = 30.0  # Before letting a probe request through.
     admin_token: str = ""  # For /admin and the dashboard; empty means local requests only.

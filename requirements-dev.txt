@@ -1,0 +1,5 @@
+-r requirements.txt
+pytest>=8.3
+fakeredis[lua]>=2.26
+anthropic>=1.13          # benchmarks and demos use the real SDK as the client
+fastembed>=0.9           # semantic cache (SEMANTIC_CACHE=true) and bench/semantic_eval.py

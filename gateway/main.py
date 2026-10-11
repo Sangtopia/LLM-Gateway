@@ -27,6 +27,10 @@ async def lifespan(app: FastAPI):
     app.state.http = httpx.AsyncClient(
         base_url=settings.anthropic_base_url,
         timeout=httpx.Timeout(settings.upstream_read_timeout_s, connect=settings.upstream_connect_timeout_s),
+        limits=httpx.Limits(
+            max_connections=settings.upstream_max_connections,
+            max_keepalive_connections=settings.upstream_max_keepalive,
+        ),
     )
     app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)
     app.state.fallback_chains = settings.fallback_chains

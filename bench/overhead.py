@@ -27,9 +27,9 @@ GATEWAY_PORT = 9101
 BODY = {"model": "claude-haiku-5-5", "max_tokens": 20, "messages": [{"role": "user", "content": "Say hi in 3 words"}]}
 
 
-def start(app: str, port: int, env: dict | None = None) -> subprocess.Popen:
+def start(app: str, port: int, env: dict | None = None, extra_args: list[str] | None = None) -> subprocess.Popen:
     proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", app, "--port", str(port), "--log-level", "warning"],
+        [sys.executable, "-m", "uvicorn", app, "--port", str(port), "--log-level", "warning", *(extra_args or [])],
         env={**os.environ, **(env or {})},
     )
     for _ in range(50):
@@ -40,6 +40,16 @@ def start(app: str, port: int, env: dict | None = None) -> subprocess.Popen:
             time.sleep(0.2)
     proc.kill()
     raise RuntimeError(f"{app} did not start on port {port}")
+
+
+def stop(proc: subprocess.Popen) -> None:
+    """Stop a server and everything it started. uvicorn --workers spawns child processes
+    that outlive the parent on Windows (holding the port and any output pipe) unless the
+    whole tree is killed."""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True)
+    else:
+        proc.kill()
 
 
 def time_full(client: httpx.Client, url: str) -> float:
@@ -116,8 +126,8 @@ def main() -> None:
             added95 = percentile(g, 95) - percentile(d, 95)
             print(f"{name:<28}{d50:>10.2f}ms{g50:>11.2f}ms{g50 - d50:>9.2f}ms{added95:>9.2f}ms")
     finally:
-        gateway.kill()
-        fake.kill()
+        stop(gateway)
+        stop(fake)
 
 
 if __name__ == "__main__":
