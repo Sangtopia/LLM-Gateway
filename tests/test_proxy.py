@@ -928,3 +928,72 @@ def test_when_every_model_is_paced_the_request_is_sent_anyway():
     client.post("/v1/messages", json={"model": "claude-haiku-5-5"})  # No fallback chain for Haiku.
     resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"})
     assert resp.status_code == 200 and resp.headers["x-gateway-model"] == "claude-haiku-5-5"
+
+
+# --- Token counting and the up-front budget check ----------------------------------------
+
+
+def counting_paths(input_tokens: int):
+    """Upstream that answers count_tokens with `input_tokens` and messages normally; records paths and bodies."""
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.url.path, json.loads(req.content)))
+        if req.url.path.endswith("/count_tokens"):
+            return httpx.Response(200, json={"input_tokens": input_tokens})
+        return httpx.Response(200, json={"model": "claude-opus-5-5", "usage": USAGE})
+
+    return handler, calls
+
+
+def test_count_tokens_passes_through_and_is_logged_free():
+    handler, calls = counting_paths(42)
+    client, log = make_client(handler)
+    resp = client.post("/v1/messages/count_tokens", json={"model": "claude-opus-5-5", "messages": []})
+
+    assert resp.json() == {"input_tokens": 42}
+    assert calls[0][0] == "/v1/messages/count_tokens"
+    [record] = log.records
+    assert record["endpoint"] == "count_tokens" and record["cost_usd"] == 0.0 and record["input_tokens"] == 42
+
+
+def test_count_tokens_needs_a_gateway_key():
+    handler, calls = counting_paths(42)
+    client, _ = make_client(handler)
+    resp = client.post("/v1/messages/count_tokens", json={}, headers={"x-api-key": "gw-nope"})
+    assert resp.status_code == 401 and calls == []
+
+
+def test_requests_far_below_the_remaining_budget_skip_the_count():
+    handler, calls = counting_paths(10)
+    client, _ = make_client(handler)
+    app.state.limiter = FakeLimiter(Decision(True, remaining_budget_usd=50.0))
+    client.post("/v1/messages", json={"model": "claude-opus-5-5", "max_tokens": 10, "messages": []})
+    assert [path for path, _ in calls] == ["/v1/messages"]
+
+
+def test_request_whose_input_alone_exceeds_the_budget_is_rejected_before_sending():
+    big = "x" * 400_000  # ~100K tokens: about $0.40 of Opus 5.5 input.
+    handler, calls = counting_paths(100_000)
+    client, log = make_client(handler)
+    app.state.limiter = FakeLimiter(Decision(True, remaining_budget_usd=0.10))
+    resp = client.post("/v1/messages", json={"model": "claude-opus-5-5", "max_tokens": 10, "stream": True,
+                                             "messages": [{"role": "user", "content": big}]})
+
+    assert resp.status_code == 429
+    assert resp.json()["error"]["type"] == "rate_limit_error"
+    assert "$0.40" in resp.json()["error"]["message"] and "$0.10" in resp.json()["error"]["message"]
+    assert [path for path, _ in calls] == ["/v1/messages/count_tokens"]  # Never sent to the model.
+    counted = calls[0][1]
+    assert "max_tokens" not in counted and "stream" not in counted  # count_tokens rejects these.
+    assert log.records[0]["error_type"] == "gateway_budget_exceeded"
+
+
+def test_borderline_estimate_is_settled_by_the_exact_count():
+    big = "x" * 400_000  # Estimate ~$0.40, but the exact count says it's small.
+    handler, calls = counting_paths(1_000)
+    client, _ = make_client(handler)
+    app.state.limiter = FakeLimiter(Decision(True, remaining_budget_usd=0.30))
+    resp = client.post("/v1/messages", json={"model": "claude-opus-5-5", "messages": [{"role": "user", "content": big}]})
+    assert resp.status_code == 200
+    assert [path for path, _ in calls] == ["/v1/messages/count_tokens", "/v1/messages"]

@@ -119,6 +119,7 @@ class Decision:
     retry_after_s: int = 0
     limit: str | None = None  # Which limit was hit: "requests", "tokens" or "monthly budget".
     message: str | None = None
+    remaining_budget_usd: float | None = None  # Set when the key has a budget and the request is allowed.
 
 
 ALLOW = Decision(True)
@@ -245,6 +246,8 @@ class RateLimiter:
                     limit=limit,
                     message=f"Gateway key {key.id} exceeded its {limit} per minute limit.",
                 )
+        if has_budget:
+            return Decision(True, remaining_budget_usd=key.monthly_budget_usd - spent / MICRODOLLARS)
         return ALLOW
 
     async def _rebuild_spend(self, key_id: str, now: datetime) -> int:

@@ -86,6 +86,8 @@ flowchart LR
 - **Monthly dollar budgets** are tracked per key per UTC month, in millionths of a dollar.
   - If Redis loses the counter, it's rebuilt from the request log.
   - Over-limit requests get a 429 with `Retry-After`, in Anthropic's error format.
+- **Budget check before sending:** for a key with a budget, the gateway estimates the request's input cost from its size. If that comes within 2x of the remaining budget, it asks Anthropic's `count_tokens` for the exact figure. A request whose input alone would exceed the remaining budget gets a 429 before anything is spent. Output isn't checked, because its length isn't known in advance.
+- **`POST /v1/messages/count_tokens`** passes through with gateway-key auth and is logged. Counting is free at Anthropic, so it doesn't use the budget.
 - **If Redis is down, requests are let through.** After a Redis failure the gateway skips Redis for 5 seconds, so only one request pays for the timeout.
 
 ### Reliability
@@ -304,7 +306,7 @@ I also wanted to measure each piece rather than assume. The Claude-only scope le
 
 ## Limitations
 
-- Only `POST /v1/messages` is proxied. Batches, token counting and the Models API aren't yet.
+- `POST /v1/messages` and `/v1/messages/count_tokens` are proxied; Batches and the Models API aren't yet.
 - The refusal fallback only covers non-streaming requests: a stream that refuses has usually sent text already.
 - Load was measured against a fake upstream on one machine, not against Anthropic at volume.
 - The help desk results come from one agent and 64 tickets, and two policies were tuned on those same tickets.

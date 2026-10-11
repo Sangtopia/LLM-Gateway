@@ -13,11 +13,11 @@ from gateway.config import settings
 from gateway.db import RequestLogger
 from gateway import metrics
 from gateway.keys import KeyStore, extract_key
-from gateway.models import cache_savings_usd, cost_usd
+from gateway.models import cache_savings_usd, cost_usd, format_usd
 from gateway.promptcache import apply_prompt_caching
 from gateway.responsecache import ResponseCache, cache_key, cache_mode, cache_ttl
 from gateway.semanticcache import SemanticCache, semantic_scope, semantic_threshold
-from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
+from gateway.ratelimit import RateLimiter, next_month_start, tokens_for_rate_limit
 from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
 from gateway.routing import CHARS_PER_TOKEN, Router
 from gateway.sse import StreamTracker
@@ -34,6 +34,13 @@ FORWARD_RESPONSE_PREFIXES = ("anthropic-", "retry-after", "request-id", "content
 
 # How many times a stream that fails before sending any content is transparently restarted.
 MAX_STREAM_RECOVERIES = 2
+
+# Fields /v1/messages accepts that /v1/messages/count_tokens rejects ("Extra inputs are not
+# permitted"). They shape generation, not the prompt, so they don't change the count.
+GENERATION_ONLY_FIELDS = {
+    "max_tokens", "stream", "metadata", "stop_sequences", "temperature", "top_p", "top_k",
+    "service_tier", "fallbacks", "speed", "inference_geo", "container",
+}
 
 
 def upstream_headers(request: Request) -> dict[str, str]:
@@ -96,7 +103,7 @@ def write_log(request_log: RequestLogger, record: dict) -> None:
     metrics.observe(record)
 
 
-API_ERROR_TYPES = {401: "authentication_error", 503: "overloaded_error", 504: "timeout_error"}
+API_ERROR_TYPES = {401: "authentication_error", 429: "rate_limit_error", 503: "overloaded_error", 504: "timeout_error"}
 
 
 def fail(record: dict, request_log: RequestLogger, started: float, status: int, error_type: str, message: str) -> JSONResponse:
@@ -225,6 +232,78 @@ class UpstreamCall:
         return Upstream(message=f"Could not reach Anthropic ({self.attempts[-1].error}).")
 
 
+async def count_input_tokens(http: httpx.AsyncClient, headers: dict[str, str], request: dict, model: str) -> int | None:
+    """Exact input tokens for `request` on `model` from Anthropic's count_tokens, or None if it fails."""
+    body = {k: v for k, v in request.items() if k not in GENERATION_ONLY_FIELDS} | {"model": model}
+    count_headers = {k: v for k, v in headers.items() if k.lower() != "accept-encoding"}
+    try:
+        resp = await http.post("/v1/messages/count_tokens", json=body, headers=count_headers, timeout=10.0)
+    except httpx.HTTPError:
+        return None
+    tokens = parse_json_object(resp.content).get("input_tokens") if resp.status_code == 200 else None
+    return tokens if isinstance(tokens, int) else None
+
+
+async def input_exceeds_budget(
+    http: httpx.AsyncClient, headers: dict[str, str], request: dict, body_size: int, model: str | None, remaining: float
+) -> float | None:
+    """The input cost of this request if it alone exceeds the key's remaining budget, else None.
+
+    A size-based estimate (about 4 characters per token) is free and settles almost every
+    request. Only when it comes within 2x of the remaining budget does the gateway ask
+    count_tokens for the exact figure. The check covers input only: output length isn't
+    known until the model writes it.
+    """
+    if not model:
+        return None
+    estimate = cost_usd(model, {"input_tokens": body_size // CHARS_PER_TOKEN})
+    if estimate is None or estimate * 2 < remaining:
+        return None
+    exact_tokens = await count_input_tokens(http, headers, request, model)
+    cost = cost_usd(model, {"input_tokens": exact_tokens}) if exact_tokens is not None else estimate
+    return cost if cost > remaining else None
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request) -> Response:
+    """Pass through to Anthropic's token counter. Free upstream, so it doesn't touch budgets."""
+    started = time.perf_counter()
+    request_log: RequestLogger = request.app.state.request_log
+    body = await request.body()
+    parsed = parse_json_object(body)
+    record = {
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.now(UTC),
+        "endpoint": "count_tokens",
+        "model": parsed.get("model") if isinstance(parsed.get("model"), str) else None,
+        "provider": "anthropic",
+        "stream": False,
+        "cache_hit": False,
+        "fallback_used": False,
+    }
+    api_key = await request.app.state.keys.authenticate(extract_key(request.headers))
+    if api_key is None:
+        return fail(record, request_log, started, 401, "authentication_error", "Invalid or missing gateway API key.")
+    record["api_key_id"] = api_key.id
+    http: httpx.AsyncClient = request.app.state.http
+    try:
+        upstream = await http.post("/v1/messages/count_tokens", content=body, headers=upstream_headers(request), timeout=30.0)
+    except httpx.HTTPError as exc:
+        return fail(record, request_log, started, 502, "upstream_unreachable", f"Could not reach Anthropic: {type(exc).__name__}")
+    payload = parse_json_object(upstream.content)
+    record.update(
+        status_code=upstream.status_code,
+        outcome="ok" if upstream.status_code == 200 else "error",
+        error_type=None if upstream.status_code == 200 else (payload.get("error") or {}).get("type"),
+        input_tokens=payload.get("input_tokens"),
+        cost_usd=0.0,
+        latency_ms=elapsed_ms(started),
+        upstream_request_id=upstream.headers.get("request-id"),
+    )
+    write_log(request_log, record)
+    return Response(content=upstream.content, status_code=upstream.status_code, headers=client_headers(upstream))
+
+
 @router.post("/v1/messages")
 async def messages(request: Request) -> Response:
     started = time.perf_counter()
@@ -326,6 +405,21 @@ async def messages(request: Request) -> Response:
         if model and fallback_allowed:
             chain += request.app.state.fallback_chains.get(model, [])
     primary = chain[0]  # The model a fallback is measured against.
+
+    if decision.remaining_budget_usd is not None:
+        too_expensive = await input_exceeds_budget(
+            request.app.state.http, headers, parsed, len(body), primary, decision.remaining_budget_usd
+        )
+        if too_expensive is not None:
+            message = (
+                f"This request's input alone would cost about {format_usd(too_expensive)}, more than the "
+                f"{format_usd(decision.remaining_budget_usd)} left in gateway key {api_key.id}'s monthly budget."
+            )
+            response = fail(record, request_log, started, 429, "gateway_budget_exceeded", message)
+            # The budget only grows back at the start of next month.
+            now = datetime.now(UTC)
+            response.headers["retry-after"] = str(max(1, int((next_month_start(now) - now).total_seconds())))
+            return response
     call = UpstreamCall(
         http=request.app.state.http,
         headers=headers,
