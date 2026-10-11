@@ -59,6 +59,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.breaker = CircuitBreaker(failure_threshold=1_000)  # Effectively off; tested on its own.
     app.state.router = Router(DEFAULT_ALIASES, LatencyTracker())
     app.state.response_cache = ResponseCache(fakeredis.FakeAsyncRedis())
+    app.state.semantic_cache = None
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -722,7 +723,7 @@ def test_cache_miss_then_hit_with_zero_cost():
     first = client.post("/v1/messages", json=body, headers=CACHE_ON)
     second = client.post("/v1/messages", json=body, headers=CACHE_ON)
 
-    assert first.headers["x-gateway-cache"] == "miss" and second.headers["x-gateway-cache"] == "hit"
+    assert first.headers["x-gateway-cache"] == "miss" and second.headers["x-gateway-cache"] == "hit-exact"
     assert second.json() == first.json()  # Same answer, including the "n": 1 from the first call.
     assert len(calls) == 1
     hit = log.records[1]
@@ -778,8 +779,68 @@ def test_streams_are_cached_and_replayed():
     with client.stream("POST", "/v1/messages", json=body, headers=CACHE_ON) as second:
         second_body = second.read()
 
-    assert second.headers["x-gateway-cache"] == "hit"
+    assert second.headers["x-gateway-cache"] == "hit-exact"
     assert second.headers["content-type"].startswith("text/event-stream")
     assert second_body == first_body == b"".join(SSE_EVENTS)
     assert len(calls) == 1
     assert log.records[1]["cache_hit"] is True
+
+
+class FakeEmbedder:
+    """Maps known texts to fixed vectors, so tests never load a model."""
+
+    VECTORS = {"reset my password": (1.0, 0.0), "how do I reset my password": (0.99, 0.141), "printer jam": (0.0, 1.0)}
+
+    async def embed(self, text):
+        import numpy as np
+
+        v = np.asarray(self.VECTORS[text], dtype=np.float32)
+        return v / np.linalg.norm(v)
+
+
+def semantic_client(handler):
+    from gateway.semanticcache import SemanticCache
+
+    client, log = make_client(handler)
+    app.state.semantic_cache = SemanticCache(app.state.response_cache._redis, FakeEmbedder())
+    return client, log
+
+
+def ask(client, text, **headers):
+    return client.post(
+        "/v1/messages",
+        json={"model": "claude-haiku-5-5", "messages": [{"role": "user", "content": text}]},
+        headers={"x-gateway-cache": "semantic", **headers},
+    )
+
+
+def test_semantic_cache_serves_a_paraphrase():
+    handler, calls = counting_upstream()
+    client, log = semantic_client(handler)
+    first = ask(client, "reset my password")
+    second = ask(client, "how do I reset my password")
+
+    assert second.headers["x-gateway-cache"] == "hit-semantic"
+    assert float(second.headers["x-gateway-cache-similarity"]) > 0.98
+    assert second.json() == first.json() and len(calls) == 1
+    assert log.records[1]["cache_kind"] == "semantic" and log.records[1]["cache_similarity"] > 0.98
+
+
+def test_semantic_cache_misses_on_different_meaning_and_on_other_scope():
+    handler, calls = counting_upstream()
+    client, _ = semantic_client(handler)
+    ask(client, "reset my password", **{"x-gateway-cache-scope": "user-1"})
+    other_meaning = ask(client, "printer jam", **{"x-gateway-cache-scope": "user-1"})
+    other_user = ask(client, "how do I reset my password", **{"x-gateway-cache-scope": "user-2"})
+
+    assert other_meaning.headers["x-gateway-cache"] == "miss"
+    assert other_user.headers["x-gateway-cache"] == "miss"  # Same meaning, different user: never shared.
+    assert len(calls) == 3
+
+
+def test_exact_mode_never_matches_by_meaning():
+    handler, calls = counting_upstream()
+    client, _ = semantic_client(handler)
+    ask(client, "reset my password", **{"x-gateway-cache": "on"})
+    resp = ask(client, "how do I reset my password", **{"x-gateway-cache": "on"})
+    assert resp.headers["x-gateway-cache"] == "miss" and len(calls) == 2

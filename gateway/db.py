@@ -49,6 +49,8 @@ requests_table = Table(
     Column("prompt_cache_savings_usd", Float),  # Saved by Anthropic prompt caching (negative: unread writes).
     Column("prompt_cache_added", Boolean),  # The gateway added cache_control to this request.
     Column("response_cache_saved_usd", Float),  # On a response cache hit: what the original request cost.
+    Column("cache_kind", String),  # "exact" or "semantic" on a response cache hit.
+    Column("cache_similarity", Float),  # Cosine similarity of a semantic hit.
     Column("latency_ms", Float, nullable=False),  # Request arrival to last byte sent.
     Column("ttft_ms", Float),  # Request arrival to first content delta (streams only).
     Column("upstream_ms", Float),  # Time waiting for upstream response headers.

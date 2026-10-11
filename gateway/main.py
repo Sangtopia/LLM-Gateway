@@ -16,6 +16,7 @@ from gateway.keys import KeyStore
 from gateway.proxy import router
 from gateway.ratelimit import RateLimiter
 from gateway.responsecache import ResponseCache
+from gateway.semanticcache import Embedder, SemanticCache
 from gateway.retry import RetryPolicy
 from gateway.routing import LatencyTracker, Router
 
@@ -51,11 +52,14 @@ async def lifespan(app: FastAPI):
         )
     )
     app.state.response_cache = ResponseCache(redis)
+    app.state.semantic_cache = SemanticCache(redis, Embedder()) if settings.semantic_cache else None
     app.state.limiter = RateLimiter(redis, load_spend=lambda key_id, since: spend_since(engine, key_id, since))
     yield
     await app.state.http.aclose()
     await app.state.limiter.drain()
     await app.state.response_cache.drain()
+    if app.state.semantic_cache:
+        await app.state.semantic_cache.drain()
     await redis.aclose()
     await app.state.request_log.stop()
     await engine.dispose()

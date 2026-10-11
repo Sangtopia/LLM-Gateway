@@ -15,7 +15,8 @@ from gateway import metrics
 from gateway.keys import KeyStore, extract_key
 from gateway.models import cache_savings_usd, cost_usd
 from gateway.promptcache import apply_prompt_caching
-from gateway.responsecache import ResponseCache, cache_key, cache_requested, cache_ttl
+from gateway.responsecache import ResponseCache, cache_key, cache_mode, cache_ttl
+from gateway.semanticcache import SemanticCache, semantic_scope, semantic_threshold
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
 from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
 from gateway.routing import Router
@@ -252,20 +253,36 @@ async def messages(request: Request) -> Response:
         return response
 
     response_cache: ResponseCache = request.app.state.response_cache
-    use_cache = cache_requested(request.headers)
+    semantic_cache: SemanticCache | None = request.app.state.semantic_cache
+    mode = cache_mode(request.headers)
+    use_cache = mode is not None
     key_for_cache = cache_key(parsed, request.headers, api_key.id) if use_cache else None
-    if use_cache and (hit := await response_cache.get(key_for_cache)):
+    hit, similarity = (await response_cache.get(key_for_cache) if use_cache else None), None
+    semantic = None  # (scope, vector) when the semantic cache applies to this request.
+    if hit is None and mode == "semantic" and semantic_cache is not None:
+        if scoped := semantic_scope(parsed, request.headers, api_key.id):
+            scope, text = scoped
+            vector = await semantic_cache.embedder.embed(text)
+            semantic = (scope, vector)
+            if found := await semantic_cache.lookup(scope, vector, semantic_threshold(request.headers)):
+                hit, similarity = found
+    if hit:
         record.update(
             status_code=200,
             outcome="ok",
             cache_hit=True,
+            cache_kind="semantic" if similarity is not None else "exact",
+            cache_similarity=round(similarity, 4) if similarity is not None else None,
             served_model=hit["model"],
             cost_usd=0.0,
             response_cache_saved_usd=hit["cost_usd"],
             latency_ms=elapsed_ms(started),
         )
         write_log(request_log, record)
-        hit_headers = {"x-gateway-cache": "hit", **({"x-gateway-model": hit["model"]} if hit["model"] else {})}
+        hit_headers = {"x-gateway-cache": f"hit-{record['cache_kind']}",
+                       **({"x-gateway-model": hit["model"]} if hit["model"] else {})}
+        if similarity is not None:
+            hit_headers["x-gateway-cache-similarity"] = f"{similarity:.4f}"
         body_bytes = hit["body"].encode("utf-8")
         if stream:
             return StreamingResponse(iter([body_bytes]), media_type=hit["content_type"], headers=hit_headers)
@@ -352,9 +369,10 @@ async def messages(request: Request) -> Response:
         write_log(request_log, record)
         if use_cache and record["outcome"] == "ok":
             content_type = upstream.headers.get("content-type", "application/json")
-            response_cache.put_later(
-                key_for_cache, upstream.content, content_type, served, record.get("cost_usd"), cache_ttl(request.headers)
-            )
+            ttl = cache_ttl(request.headers)
+            response_cache.put_later(key_for_cache, upstream.content, content_type, served, record.get("cost_usd"), ttl)
+            if semantic:
+                semantic_cache.store_later(*semantic, upstream.content, content_type, served, record.get("cost_usd"), ttl)
         return Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
 
     async def relay():
@@ -462,9 +480,10 @@ async def messages(request: Request) -> Response:
             limiter.record_usage(api_key, tokens_for_rate_limit(tracker.usage), record["cost_usd"])
             write_log(request_log, record)
             if use_cache and record["outcome"] == "ok":
-                response_cache.put_later(
-                    key_for_cache, b"".join(sent), "text/event-stream", served, record.get("cost_usd"),
-                    cache_ttl(request.headers),
-                )
+                ttl = cache_ttl(request.headers)
+                body = b"".join(sent)
+                response_cache.put_later(key_for_cache, body, "text/event-stream", served, record.get("cost_usd"), ttl)
+                if semantic:
+                    semantic_cache.store_later(*semantic, body, "text/event-stream", served, record.get("cost_usd"), ttl)
 
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=response_headers)

@@ -4,7 +4,12 @@ Claude 5 models don't accept sampling parameters, so no request is guaranteed to
 produce the same answer twice and the gateway can't decide on its own that a
 response is safe to reuse. Apps opt in per request with `x-gateway-cache: on`
 when a previous answer to the identical request is acceptable (optionally
-`x-gateway-cache-ttl: <seconds>`).
+`x-gateway-cache-ttl: <seconds>`). `x-gateway-cache: semantic` also matches
+requests that mean the same thing (see semanticcache.py).
+
+`x-gateway-cache-scope` narrows sharing further, e.g. to one end user: the gateway
+can't tell which parts of a prompt are personal, and identical text from two
+different users often needs two different answers.
 
 The key is a hash of the request body (JSON with sorted keys, so field order
 doesn't matter), the anthropic-version and anthropic-beta headers, and the
@@ -30,8 +35,10 @@ MAX_TTL_S = 86_400
 MAX_ENTRY_BYTES = 256 * 1024
 
 
-def cache_requested(headers) -> bool:
-    return headers.get("x-gateway-cache", "").lower() == "on"
+def cache_mode(headers) -> str | None:
+    """None (no caching), "exact", or "semantic" (exact first, then by meaning)."""
+    value = headers.get("x-gateway-cache", "").lower()
+    return {"on": "exact", "exact": "exact", "semantic": "semantic"}.get(value)
 
 
 def cache_ttl(headers) -> int:
@@ -49,6 +56,7 @@ def cache_key(request: dict, headers, key_id: str) -> str:
             "version": headers.get("anthropic-version", ""),
             "beta": headers.get("anthropic-beta", ""),
             "key": key_id,
+            "scope": headers.get("x-gateway-cache-scope", ""),
         },
         sort_keys=True,
         separators=(",", ":"),

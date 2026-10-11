@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     circuit_failure_threshold: int = 5  # Consecutive failed attempts before a model is skipped.
     circuit_cooldown_s: float = 30.0  # Before letting a probe request through.
     admin_token: str = ""  # For /admin and the dashboard; empty means local requests only.
+    semantic_cache: bool = False  # Needs fastembed; downloads a ~30 MB embedding model on first use.
     auto_prompt_cache: bool = True  # Add cache_control to requests that don't set it (see promptcache.py).
 
     # JSON in the environment, e.g. FALLBACK_CHAINS={"claude-sonnet-5-5": ["claude-haiku-5-5"]}
