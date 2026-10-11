@@ -2,6 +2,7 @@ import pytest
 import gzip
 import json
 
+import fakeredis
 import httpx
 from fastapi.testclient import TestClient
 
@@ -10,6 +11,7 @@ from gateway.config import settings
 from gateway.keys import ApiKey
 from gateway.main import app
 from gateway.ratelimit import ALLOW, Decision
+from gateway.responsecache import ResponseCache
 from gateway.retry import RetryPolicy
 from gateway.routing import DEFAULT_ALIASES, LatencyTracker, Router
 
@@ -24,9 +26,14 @@ class FakeRequestLog:
         self.records.append(record)
 
 
+OTHER_KEY = "gw-other-key"
+
+
 class FakeKeyStore:
     async def authenticate(self, plaintext: str | None) -> ApiKey | None:
-        return ApiKey(id="key_test", name="test") if plaintext == TEST_KEY else None
+        return {TEST_KEY: ApiKey(id="key_test", name="test"), OTHER_KEY: ApiKey(id="key_other", name="other")}.get(
+            plaintext or ""
+        )
 
 
 class FakeLimiter:
@@ -51,6 +58,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.fallback_chains = {"claude-sonnet-5-5": ["claude-sonnet-5", "claude-haiku-5-5"]}
     app.state.breaker = CircuitBreaker(failure_threshold=1_000)  # Effectively off; tested on its own.
     app.state.router = Router(DEFAULT_ALIASES, LatencyTracker())
+    app.state.response_cache = ResponseCache(fakeredis.FakeAsyncRedis())
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -685,3 +693,93 @@ def test_app_can_opt_out_of_prompt_caching():
     client.post("/v1/messages", json={"system": "s", "messages": []}, headers={"x-gateway-prompt-cache": "off"})
     assert seen["body"]["system"] == "s"
     assert log.records[0]["prompt_cache_added"] is False
+
+
+# --- Response cache -----------------------------------------------------------------
+
+CACHE_ON = {"x-gateway-cache": "on"}
+
+
+def counting_upstream(status: int = 200):
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(req.content))
+        if json.loads(req.content).get("stream"):
+            return stream_handler(SSE_EVENTS)(req)
+        if status != 200:
+            return httpx.Response(status, json={"type": "error", "error": {"type": "overloaded_error"}})
+        return httpx.Response(200, json={"model": "claude-sonnet-5-5", "usage": USAGE, "n": len(calls)})
+
+    return handler, calls
+
+
+def test_cache_miss_then_hit_with_zero_cost():
+    handler, calls = counting_upstream()
+    client, log = make_client(handler)
+    body = {"model": "claude-sonnet-5-5", "messages": [{"role": "user", "content": "hi"}]}
+
+    first = client.post("/v1/messages", json=body, headers=CACHE_ON)
+    second = client.post("/v1/messages", json=body, headers=CACHE_ON)
+
+    assert first.headers["x-gateway-cache"] == "miss" and second.headers["x-gateway-cache"] == "hit"
+    assert second.json() == first.json()  # Same answer, including the "n": 1 from the first call.
+    assert len(calls) == 1
+    hit = log.records[1]
+    assert hit["cache_hit"] is True and hit["cost_usd"] == 0.0
+    assert hit["response_cache_saved_usd"] == log.records[0]["cost_usd"]
+    assert hit["served_model"] == "claude-sonnet-5-5"
+
+
+def test_cache_is_opt_in():
+    handler, calls = counting_upstream()
+    client, _ = make_client(handler)
+    for _ in range(2):
+        resp = client.post("/v1/messages", json={"model": "claude-sonnet-5-5", "messages": []})
+    assert len(calls) == 2 and "x-gateway-cache" not in resp.headers
+
+
+def test_cache_key_ignores_field_order_but_not_content():
+    handler, calls = counting_upstream()
+    client, _ = make_client(handler)
+    client.post("/v1/messages", json={"model": "claude-sonnet-5-5", "max_tokens": 5}, headers=CACHE_ON)
+    client.post("/v1/messages", json={"max_tokens": 5, "model": "claude-sonnet-5-5"}, headers=CACHE_ON)
+    client.post("/v1/messages", json={"model": "claude-sonnet-5-5", "max_tokens": 6}, headers=CACHE_ON)
+    client.post(
+        "/v1/messages", json={"model": "claude-sonnet-5-5", "max_tokens": 5}, headers={**CACHE_ON, "anthropic-beta": "x"}
+    )
+    assert len(calls) == 3  # Reordered fields hit; different max_tokens and different beta miss.
+
+
+def test_cached_answers_are_never_shared_between_gateway_keys():
+    handler, calls = counting_upstream()
+    client, _ = make_client(handler)
+    body = {"model": "claude-sonnet-5-5", "messages": []}
+    client.post("/v1/messages", json=body, headers=CACHE_ON)
+    other = client.post("/v1/messages", json=body, headers={**CACHE_ON, "x-api-key": OTHER_KEY})
+    assert other.headers["x-gateway-cache"] == "miss"
+    assert len(calls) == 2
+
+
+def test_errors_are_not_cached():
+    handler, calls = counting_upstream(status=529)
+    client, _ = make_client(handler)
+    for _ in range(2):
+        client.post("/v1/messages", json={"model": "claude-haiku-5-5"}, headers=CACHE_ON)
+    assert len(calls) == 6  # 3 tries each, nothing served from cache.
+
+
+def test_streams_are_cached_and_replayed():
+    handler, calls = counting_upstream()
+    client, log = make_client(handler)
+    body = {"model": "claude-sonnet-5-5", "stream": True}
+    with client.stream("POST", "/v1/messages", json=body, headers=CACHE_ON) as first:
+        first_body = first.read()
+    with client.stream("POST", "/v1/messages", json=body, headers=CACHE_ON) as second:
+        second_body = second.read()
+
+    assert second.headers["x-gateway-cache"] == "hit"
+    assert second.headers["content-type"].startswith("text/event-stream")
+    assert second_body == first_body == b"".join(SSE_EVENTS)
+    assert len(calls) == 1
+    assert log.records[1]["cache_hit"] is True

@@ -14,6 +14,7 @@ from gateway.db import RequestLogger
 from gateway.keys import KeyStore, extract_key
 from gateway.models import cache_savings_usd, cost_usd
 from gateway.promptcache import apply_prompt_caching
+from gateway.responsecache import ResponseCache, cache_key, cache_requested, cache_ttl
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
 from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
 from gateway.routing import Router
@@ -248,6 +249,26 @@ async def messages(request: Request) -> Response:
         response.headers["retry-after"] = str(decision.retry_after_s)
         return response
 
+    response_cache: ResponseCache = request.app.state.response_cache
+    use_cache = cache_requested(request.headers)
+    key_for_cache = cache_key(parsed, request.headers, api_key.id) if use_cache else None
+    if use_cache and (hit := await response_cache.get(key_for_cache)):
+        record.update(
+            status_code=200,
+            outcome="ok",
+            cache_hit=True,
+            served_model=hit["model"],
+            cost_usd=0.0,
+            response_cache_saved_usd=hit["cost_usd"],
+            latency_ms=elapsed_ms(started),
+        )
+        write_log(request_log, record)
+        hit_headers = {"x-gateway-cache": "hit", **({"x-gateway-model": hit["model"]} if hit["model"] else {})}
+        body_bytes = hit["body"].encode("utf-8")
+        if stream:
+            return StreamingResponse(iter([body_bytes]), media_type=hit["content_type"], headers=hit_headers)
+        return Response(content=body_bytes, media_type=hit["content_type"], headers=hit_headers)
+
     headers = upstream_headers(request)
     timeout = None
     if stream:
@@ -307,6 +328,8 @@ async def messages(request: Request) -> Response:
         response_headers["x-gateway-model"] = served
     if route is not None:
         response_headers["x-gateway-route"] = record["route"]
+    if use_cache:
+        response_headers["x-gateway-cache"] = "miss"
 
     # Errors arrive as a plain JSON body even when streaming was requested,
     # so read them fully and return them like a normal response.
@@ -325,6 +348,11 @@ async def messages(request: Request) -> Response:
             record.update(outcome="error", error_type=error_type)
         record["latency_ms"] = elapsed_ms(started)
         write_log(request_log, record)
+        if use_cache and record["outcome"] == "ok":
+            content_type = upstream.headers.get("content-type", "application/json")
+            response_cache.put_later(
+                key_for_cache, upstream.content, content_type, served, record.get("cost_usd"), cache_ttl(request.headers)
+            )
         return Response(content=upstream.content, status_code=upstream.status_code, headers=response_headers)
 
     async def relay():
@@ -345,6 +373,7 @@ async def messages(request: Request) -> Response:
         recoveries = 0
         failed_models: set[str | None] = set()
         tracker = StreamTracker()
+        sent: list[bytes] = []  # Everything the app received, for the response cache.
         try:
             while True:
                 tracker = StreamTracker()
@@ -355,11 +384,15 @@ async def messages(request: Request) -> Response:
                     async for chunk in upstream.aiter_bytes():  # decoded, in case upstream compresses anyway
                         tracker.feed(chunk)
                         if released:
+                            if use_cache:
+                                sent.append(chunk)
                             yield chunk
                             continue
                         held.append(chunk)
                         if tracker.saw_content or tracker.completed:
                             record["ttft_ms"] = elapsed_ms(started)
+                            if use_cache:
+                                sent.extend(held)
                             if served and len(call.attempts) == 1:
                                 # A clean sample (no retries or fallbacks) of this model's
                                 # speed, timed from the upstream call, for "fastest" routing.
@@ -426,5 +459,10 @@ async def messages(request: Request) -> Response:
             add_usage(record, tracker.model or model, tracker.usage)
             limiter.record_usage(api_key, tokens_for_rate_limit(tracker.usage), record["cost_usd"])
             write_log(request_log, record)
+            if use_cache and record["outcome"] == "ok":
+                response_cache.put_later(
+                    key_for_cache, b"".join(sent), "text/event-stream", served, record.get("cost_usd"),
+                    cache_ttl(request.headers),
+                )
 
     return StreamingResponse(relay(), status_code=upstream.status_code, headers=response_headers)
