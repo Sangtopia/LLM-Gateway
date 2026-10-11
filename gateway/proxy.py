@@ -12,7 +12,8 @@ from gateway.circuit import CircuitBreaker, attempt_succeeded
 from gateway.config import settings
 from gateway.db import RequestLogger
 from gateway.keys import KeyStore, extract_key
-from gateway.models import cost_usd
+from gateway.models import cache_savings_usd, cost_usd
+from gateway.promptcache import apply_prompt_caching
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
 from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
 from gateway.routing import Router
@@ -66,6 +67,7 @@ def add_usage(record: dict, model: str | None, usage: dict) -> None:
         cache_read_tokens=usage.get("cache_read_input_tokens"),
         cache_write_tokens=cache_write,
         cost_usd=cost_usd(model, usage) if model and usage else None,
+        prompt_cache_savings_usd=cache_savings_usd(model, usage) if model and usage else None,
     )
 
 
@@ -212,6 +214,13 @@ async def messages(request: Request) -> Response:
 
     body = await request.body()
     parsed = parse_json_object(body)
+    prompt_cache_added = False
+    if (
+        settings.auto_prompt_cache
+        and request.headers.get("x-gateway-prompt-cache", "").lower() != "off"
+        and (with_cache := apply_prompt_caching(parsed)) is not None
+    ):
+        parsed, body, prompt_cache_added = with_cache, json.dumps(with_cache).encode(), True
     stream = parsed.get("stream") is True
     model = parsed.get("model") if isinstance(parsed.get("model"), str) else None
     record = {
@@ -222,6 +231,7 @@ async def messages(request: Request) -> Response:
         "stream": stream,
         "cache_hit": False,
         "fallback_used": False,
+        "prompt_cache_added": prompt_cache_added,
     }
 
     api_key = await keys.authenticate(extract_key(request.headers))

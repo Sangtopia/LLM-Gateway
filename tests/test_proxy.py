@@ -1,3 +1,4 @@
+import pytest
 import gzip
 import json
 
@@ -650,3 +651,37 @@ def test_streams_feed_the_latency_tracker_for_fastest_routing():
 
     latency = app.state.router.latency
     assert len(latency._samples["claude-haiku-5-5"]) == 3
+
+
+# --- Automatic prompt caching ----------------------------------------------------
+
+
+def test_gateway_adds_prompt_caching_and_logs_savings():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        usage = {"input_tokens": 50, "output_tokens": 10, "cache_read_input_tokens": 4_000, "cache_creation_input_tokens": 0}
+        return httpx.Response(200, json={"model": "claude-opus-5-5", "usage": usage})
+
+    client, log = make_client(handler)
+    client.post("/v1/messages", json={"model": "claude-opus-5-5", "system": "s", "tools": [{"name": "t"}], "messages": []})
+
+    assert seen["body"]["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert seen["body"]["cache_control"] == {"type": "ephemeral"}
+    [record] = log.records
+    assert record["prompt_cache_added"] is True
+    assert record["prompt_cache_savings_usd"] == pytest.approx(4_000 * (4.00 - 0.20) / 1e6)
+
+
+def test_app_can_opt_out_of_prompt_caching():
+    seen = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={})
+
+    client, log = make_client(handler)
+    client.post("/v1/messages", json={"system": "s", "messages": []}, headers={"x-gateway-prompt-cache": "off"})
+    assert seen["body"]["system"] == "s"
+    assert log.records[0]["prompt_cache_added"] is False

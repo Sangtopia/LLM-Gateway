@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     upstream_max_retries: int = 2
     circuit_failure_threshold: int = 5  # Consecutive failed attempts before a model is skipped.
     circuit_cooldown_s: float = 30.0  # Before letting a probe request through.
+    auto_prompt_cache: bool = True  # Add cache_control to requests that don't set it (see promptcache.py).
 
     # JSON in the environment, e.g. FALLBACK_CHAINS={"claude-sonnet-5-5": ["claude-haiku-5-5"]}
     fallback_chains: dict[str, list[str]] = Field(default_factory=lambda: dict(DEFAULT_FALLBACKS))

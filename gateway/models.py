@@ -108,3 +108,18 @@ def cost_usd(model_id: str, usage: dict, batch: bool = False) -> float | None:
     if usage.get("inference_geo") == "us" and model.us_inference_surcharge:
         total *= US_INFERENCE_MULTIPLIER
     return total * BATCH_DISCOUNT if batch else total
+
+
+def cache_savings_usd(model_id: str, usage: dict) -> float | None:
+    """What prompt caching saved on one request: its cost if every cached token had been
+    plain input, minus what it actually cost. Negative when cache writes weren't read back."""
+    cached = (usage.get("cache_read_input_tokens") or 0) + (usage.get("cache_creation_input_tokens") or 0)
+    actual = cost_usd(model_id, usage)
+    if actual is None or not cached:
+        return None if actual is None else 0.0
+    uncached_usage = {
+        "input_tokens": (usage.get("input_tokens") or 0) + cached,
+        "output_tokens": usage.get("output_tokens") or 0,
+        "inference_geo": usage.get("inference_geo"),
+    }
+    return cost_usd(model_id, uncached_usage) - actual

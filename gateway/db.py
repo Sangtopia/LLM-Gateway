@@ -46,6 +46,8 @@ requests_table = Table(
     Column("cache_read_tokens", Integer),
     Column("cache_write_tokens", Integer),
     Column("cost_usd", Float),
+    Column("prompt_cache_savings_usd", Float),  # Saved by Anthropic prompt caching (negative: unread writes).
+    Column("prompt_cache_added", Boolean),  # The gateway added cache_control to this request.
     Column("latency_ms", Float, nullable=False),  # Request arrival to last byte sent.
     Column("ttft_ms", Float),  # Request arrival to first content delta (streams only).
     Column("upstream_ms", Float),  # Time waiting for upstream response headers.
