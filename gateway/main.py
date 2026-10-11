@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from gateway.circuit import CircuitBreaker
 from gateway import metrics
 from gateway.admin import router as admin_router
+from gateway.batches import router as batches_router
 from gateway.config import settings
 from gateway.db import RequestLogger, init_db, spend_since
 from gateway.keys import KeyStore
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="LLM Gateway", lifespan=lifespan)
 app.include_router(router)
 app.include_router(admin_router)
+app.include_router(batches_router)
 
 
 @app.get("/health")

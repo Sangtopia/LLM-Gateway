@@ -78,6 +78,23 @@ api_keys_table = Table(
 )
 
 
+batches_table = Table(
+    "batches",
+    metadata,
+    Column("id", String, primary_key=True),  # Anthropic's batch id.
+    Column("api_key_id", String, nullable=False, index=True),  # The gateway key that created it.
+    Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("request_count", Integer),
+    Column("charged", Boolean, nullable=False, default=False),  # Cost added to the key's spend.
+    Column("succeeded", Integer),
+    Column("input_tokens", Integer),
+    Column("output_tokens", Integer),
+    Column("cache_read_tokens", Integer),
+    Column("cache_write_tokens", Integer),
+    Column("cost_usd", Float),  # At the batch price (50% off).
+)
+
+
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(metadata.create_all)

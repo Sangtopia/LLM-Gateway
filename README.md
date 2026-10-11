@@ -106,6 +106,12 @@ flowchart LR
   - The opening events are held back until the first text arrives. If the stream fails before then, the gateway restarts it on the next model and the app never notices.
   - After text has gone out, the gateway ends the stream with an Anthropic-style `error` event, which the SDK raises as a normal error.
 
+### Message Batches
+- `/v1/messages/batches` (create, list, retrieve, cancel, delete, results) passes through, so batch work runs at Anthropic's 50% discount.
+- **Ownership:** batch ids are organization-wide at Anthropic, so the gateway records which key created each batch. Other keys get a 404.
+- **Cost:** results are charged to the key once, at the batch price, by adding up each succeeded request's usage as the results stream past.
+- **SDK compatibility:** `results_url` is rewritten to point at the gateway, because the Anthropic SDK fetches results from that URL with the client's key.
+
 ### Routing
 - **Aliases:** apps can ask for `smart`, `balanced`, `cheap` or `fast`. An alias's ranking also serves as its fallback chain.
 - **`cheapest`** estimates this request's cost on each candidate model from the price registry, which includes Haiku 5.5's higher prices for prompts over 100K tokens.
@@ -306,7 +312,7 @@ I also wanted to measure each piece rather than assume. The Claude-only scope le
 
 ## Limitations
 
-- `POST /v1/messages` and `/v1/messages/count_tokens` are proxied; Batches and the Models API aren't yet.
+- Messages, token counting and Message Batches are proxied; the Models and Files APIs aren't.
 - The refusal fallback only covers non-streaming requests: a stream that refuses has usually sent text already.
 - Load was measured against a fake upstream on one machine, not against Anthropic at volume.
 - The help desk results come from one agent and 64 tickets, and two policies were tuned on those same tickets.
