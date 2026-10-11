@@ -28,7 +28,8 @@ def row(**overrides) -> dict:
 
 
 @pytest.fixture
-def client(tmp_path):
+def client(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "admin_token", "")  # Local-only mode, whatever the developer's .env says.
     rows = [
         row(),
         row(latency_ms=3_000.0, served_model="claude-sonnet-5", fallback_used=True, cost_usd=0.02,

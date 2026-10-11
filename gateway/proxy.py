@@ -131,7 +131,7 @@ class UpstreamCall:
 
     http: httpx.AsyncClient
     headers: dict[str, str]
-    timeout: httpx.Timeout | None
+    timeout: httpx.Timeout | httpx._client.UseClientDefault
     stream: bool
     body: bytes
     parsed: dict
@@ -289,7 +289,8 @@ async def messages(request: Request) -> Response:
         return Response(content=body_bytes, media_type=hit["content_type"], headers=hit_headers)
 
     headers = upstream_headers(request)
-    timeout = None
+    # Not None: to httpx, timeout=None means no timeout at all, not the client's default.
+    timeout = httpx.USE_CLIENT_DEFAULT
     if stream:
         # Compression would make the upstream buffer events into batches, and
         # we'd have to re-encode for the client anyway. Ask for plain bytes.

@@ -1,0 +1,116 @@
+{
+  "windows": [
+    {
+      "start_s": 0,
+      "requests": 802,
+      "succeeded": 802,
+      "served": {
+        "sonnet-5-5": 802
+      },
+      "p95_ms": 447.11657174998436
+    },
+    {
+      "start_s": 5,
+      "requests": 821,
+      "succeeded": 821,
+      "served": {
+        "sonnet-5-5": 821
+      },
+      "p95_ms": 305.8968408001647
+    },
+    {
+      "start_s": 10,
+      "requests": 826,
+      "succeeded": 826,
+      "served": {
+        "sonnet-5-5": 777,
+        "sonnet-5": 49
+      },
+      "p95_ms": 1636.5512847000787
+    },
+    {
+      "start_s": 15,
+      "requests": 558,
+      "succeeded": 558,
+      "served": {
+        "sonnet-5": 558
+      },
+      "p95_ms": 305.41486950018
+    },
+    {
+      "start_s": 20,
+      "requests": 823,
+      "succeeded": 823,
+      "served": {
+        "sonnet-5": 823
+      },
+      "p95_ms": 305.80105120011467
+    },
+    {
+      "start_s": 25,
+      "requests": 816,
+      "succeeded": 816,
+      "served": {
+        "sonnet-5": 816
+      },
+      "p95_ms": 305.64559320000626
+    },
+    {
+      "start_s": 30,
+      "requests": 825,
+      "succeeded": 825,
+      "served": {
+        "sonnet-5": 825
+      },
+      "p95_ms": 306.21083060000274
+    },
+    {
+      "start_s": 35,
+      "requests": 819,
+      "succeeded": 819,
+      "served": {
+        "sonnet-5": 819
+      },
+      "p95_ms": 305.86860400012483
+    },
+    {
+      "start_s": 40,
+      "requests": 825,
+      "succeeded": 825,
+      "served": {
+        "sonnet-5": 825
+      },
+      "p95_ms": 306.18338150004547
+    },
+    {
+      "start_s": 45,
+      "requests": 823,
+      "succeeded": 823,
+      "served": {
+        "sonnet-5": 453,
+        "sonnet-5-5": 370
+      },
+      "p95_ms": 306.30740000001424
+    },
+    {
+      "start_s": 50,
+      "requests": 824,
+      "succeeded": 824,
+      "served": {
+        "sonnet-5-5": 824
+      },
+      "p95_ms": 307.15989825000634
+    },
+    {
+      "start_s": 55,
+      "requests": 813,
+      "succeeded": 813,
+      "served": {
+        "sonnet-5-5": 813
+      },
+      "p95_ms": 306.12063610001314
+    }
+  ],
+  "succeeded": 9575,
+  "requests": 9575
+}

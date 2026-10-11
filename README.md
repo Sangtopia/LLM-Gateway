@@ -16,8 +16,9 @@ client = anthropic.Anthropic(base_url="http://localhost:8000", api_key="gw-...")
 
 Beyond that:
 
-- It adds about 1–2 ms of latency.
-- All 3,659 of 3,659 requests succeeded while the primary model was down under load.
+- It adds under 1 ms at p95 one request at a time, and about 3 ms at p95 at 100 concurrent requests (Linux).
+- One process handled 1,224 requests per second at 400 concurrent requests with no errors.
+- All 9,575 of 9,575 requests succeeded while the primary model was down under load.
 - Retries, fallbacks and stream recovery are tested with fault injection.
 
 ---
@@ -164,30 +165,34 @@ No configuration took an unsafe action on any run.
 
 ### Taking a model down under load
 
-From `bench/chaos.py`: 20 clients, 60 s. `claude-sonnet-5-5` returned 529 from second 15 to second 40, with a 10 s circuit cooldown.
+From `bench/chaos.py` on Linux (Docker): 50 clients, 60 s. `claude-sonnet-5-5` returned 529 from second 15 to second 40, with a 10 s circuit cooldown.
 
 | Seconds | Requests | Succeeded | Served by | p95 |
 |---|---|---|---|---|
-| 0–10 | 626 | 100% | sonnet-5-5 | 374 ms |
-| 10–15 | 314 | 100% | sonnet-5-5 294, sonnet-5 20 | 1,906 ms (retries before the circuit opened) |
-| 15–40, down | 1,468 | **100%** | sonnet-5 | 324–329 ms |
-| 40–50 | 631 | 100% | sonnet-5, then back to sonnet-5-5 after the circuit's test request | 323 ms |
-| 50–60 | 620 | 100% | sonnet-5-5 | 326 ms |
+| 0–10 | 1,623 | 100% | sonnet-5-5 | 306–447 ms |
+| 10–15 | 826 | 100% | sonnet-5-5 777, sonnet-5 49 | 1,637 ms (retries before the circuit opened) |
+| 15–40, down | 3,841 | **100%** | sonnet-5 | 305–306 ms |
+| 40–50 | 1,648 | 100% | sonnet-5, then back to sonnet-5-5 after the circuit's test request | 306 ms |
+| 50–60 | 1,637 | 100% | sonnet-5-5 | 306–307 ms |
 
-All **3,659 of 3,659** requests succeeded.
+All **9,575 of 9,575** requests succeeded. An earlier run on Windows with 20 clients gave the same result: 3,659 of 3,659.
 
 ### Overhead and load
 
-- **Added latency, one client at a time** (`bench/overhead.py`, 1,000 requests): **+1.1 ms at p50, +1.4 ms at p95**, both non-streaming and time to first token. Runs on a busier machine measured 1.8–2.5 ms.
-- **Under load** (`bench/load.py`, fake Anthropic answering in 300 ms):
+Measured in a Linux container (Docker Desktop, 16 CPUs) against the fake Anthropic, which answers in 300 ms. One gateway process.
+
+- **Added latency, one request at a time** (`bench/overhead.py`, 1,000 requests): **+0.7 ms at p50 and p95**, both non-streaming and time to first token. On Windows: 1.1–2.5 ms.
+- **Under load** (`bench/load.py`, aiohttp clients in a closed loop, 15 s per level):
 
 | Clients | Throughput | p95 | Errors | Added p95 |
 |---|---|---|---|---|
-| 10 | 32 req/s | 323 ms | 0 / 471 | +2.0 ms |
-| 25 | 78 req/s | 330 ms | 0 / 1,150 | +5.3 ms |
-| 50 | 154 req/s | 350 ms | 0 / 2,301 | +13.3 ms |
+| 10 | 33 req/s | 303 ms | 0 / 490 | +1.9 ms |
+| 50 | 165 req/s | 304 ms | 0 / 2,450 | +2.2 ms |
+| 100 | 328 req/s | 305 ms | 0 / 4,900 | +2.9 ms |
+| 200 | 647 req/s | 323 ms | 0 / 9,672 | +19 ms |
+| 400 | 1,224 req/s | 368 ms | 0 / 18,290 | +63 ms |
 
-Above about 50 clients, Windows loopback networking stalls even for direct calls, so those levels need a Linux run.
+With a 300 ms upstream, throughput is set by the number of clients, so these levels show the gateway keeping up rather than its maximum.
 
 **What the benchmarks caught along the way:**
 
@@ -196,6 +201,8 @@ Above about 50 clients, Windows loopback networking stalls even for direct calls
 | Looking keys up in SQLite on every request | p95 rose from 2 ms to 28 ms while the logger committed | Cache keys in memory for 30 s |
 | redis-py's default retries | Each request stalled about 5 s while Redis was down | Retries off, skip Redis for 5 s after a failure |
 | redis-py's script pipelining | An extra Redis round trip on every call | Send scripts by hash (`EVALSHA`) |
+| httpx's connection pool | Above about 50–100 concurrent upstream requests, requests stalled about 5 s; throughput fell to about 60 req/s | aiohttp networking under httpx's API ([httpx-aiohttp](https://pypi.org/project/httpx-aiohttp/)); `bench/client_check.py` compares the clients |
+| `timeout=None` passed to httpx | Means "no timeout", not "client default": non-streaming calls had no read timeout | Pass `httpx.USE_CLIENT_DEFAULT`; a real-socket test checks the 504 |
 
 ### Semantic cache false hits
 
@@ -223,7 +230,7 @@ With Docker, `docker compose up --build` starts the gateway with Redis, Postgres
 **Tests and benchmarks:**
 
 ```bash
-python -m pytest                   # 158 tests; no network or API key needed
+python -m pytest                   # 170 tests; no internet or API key needed
 python -m bench.overhead           # latency the gateway adds
 python -m bench.load               # throughput at several concurrency levels
 python -m bench.chaos              # take a model down mid-run
@@ -298,7 +305,7 @@ I also wanted to measure each piece rather than assume. The Claude-only scope le
 
 - Only `POST /v1/messages` is proxied. Batches, token counting and the Models API aren't yet.
 - The refusal fallback only covers non-streaming requests: a stream that refuses has usually sent text already.
-- Load was measured to 50 clients on Windows. The Docker Compose setup hasn't yet been run.
+- Load was measured against a fake upstream on one machine, not against Anthropic at volume.
 - The help desk results come from one agent and 64 tickets, and two policies were tuned on those same tickets.
 
 ## Repository layout
@@ -319,5 +326,5 @@ gateway/
   metrics.py        Prometheus;  admin.py + static/dashboard.html  dashboard
 bench/              fake Anthropic, overhead, load, chaos, semantic cache eval
 deploy/             Prometheus and Grafana configuration
-tests/              158 tests (fake upstream and fakeredis; no network)
+tests/              170 tests (fake upstream, fakeredis and local sockets; no internet)
 ```

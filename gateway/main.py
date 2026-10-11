@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 
 import httpx
+import httpx_aiohttp
 from fastapi import FastAPI, Response
 from redis.asyncio import BlockingConnectionPool, Redis
 from redis.asyncio.retry import Retry
@@ -23,13 +24,17 @@ from gateway.routing import LatencyTracker, Router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One pooled client for the whole app, so connections to Anthropic are reused.
+    # One pooled client for the whole app, so connections to Anthropic are reused. httpx's API
+    # with aiohttp doing the networking: httpx's own connection pool stalls for ~5s per request
+    # above ~50-100 concurrent connections, aiohttp's doesn't (bench/client_check.py).
     app.state.http = httpx.AsyncClient(
         base_url=settings.anthropic_base_url,
         timeout=httpx.Timeout(settings.upstream_read_timeout_s, connect=settings.upstream_connect_timeout_s),
-        limits=httpx.Limits(
-            max_connections=settings.upstream_max_connections,
-            max_keepalive_connections=settings.upstream_max_keepalive,
+        transport=httpx_aiohttp.AiohttpTransport(
+            limits=httpx.Limits(
+                max_connections=settings.upstream_max_connections,
+                max_keepalive_connections=settings.upstream_max_connections,
+            ),
         ),
     )
     app.state.retry_policy = RetryPolicy(max_retries=settings.upstream_max_retries)

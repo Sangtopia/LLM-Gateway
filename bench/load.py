@@ -10,9 +10,9 @@ once through the gateway. The difference is what the gateway adds under load.
 The gateway key has no limits, so the test never touches Redis: this measures the
 gateway itself, not a remote Redis's round trip or its free-tier ops limit.
 
-On Windows, loopback connections stall above roughly 50-100 concurrent clients even when
-calling the fake upstream directly, so higher levels measure the machine, not the gateway.
-Run those on Linux (e.g. in Docker).
+The load generator uses aiohttp: a single httpx client stalls above ~50 concurrent
+connections (bench/client_check.py), which would measure the client, not the gateway.
+Run high levels on Linux, e.g. in Docker; Windows loopback stalls on its own around 50-100.
 """
 
 import argparse
@@ -22,6 +22,7 @@ import statistics
 import tempfile
 import time
 
+import aiohttp
 import httpx
 
 from bench.overhead import FAKE_PORT, GATEWAY_PORT, create_key, start, stop
@@ -29,16 +30,12 @@ from bench.overhead import FAKE_PORT, GATEWAY_PORT, create_key, start, stop
 BODY = {"model": "claude-haiku-5-5", "max_tokens": 20, "messages": [{"role": "user", "content": "Say hi in 3 words"}]}
 
 
-async def one(client: httpx.AsyncClient, url: str, stream: bool) -> float:
+async def one(session: aiohttp.ClientSession, url: str, stream: bool) -> float:
     started = time.perf_counter()
-    if stream:
-        async with client.stream("POST", url, json={**BODY, "stream": True}) as resp:
-            resp.raise_for_status()
-            async for _ in resp.aiter_bytes():
-                pass
-    else:
-        resp = await client.post(url, json=BODY)
+    async with session.post(url, json={**BODY, "stream": True} if stream else BODY) as resp:
         resp.raise_for_status()
+        async for _ in resp.content.iter_any():
+            pass
     return (time.perf_counter() - started) * 1000
 
 
@@ -46,8 +43,9 @@ async def run_level(url: str, key: str, concurrency: int, duration: float, strea
     latencies: list[float] = []
     errors = 0
     deadline = time.perf_counter() + duration
-    limits = httpx.Limits(max_connections=concurrency, max_keepalive_connections=concurrency)
-    async with httpx.AsyncClient(headers={"x-api-key": key}, timeout=30, limits=limits) as client:
+    connector = aiohttp.TCPConnector(limit=concurrency)
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(headers={"x-api-key": key}, connector=connector, timeout=timeout) as client:
         await asyncio.gather(*(one(client, url, stream) for _ in range(min(concurrency, 20))))  # Warm up.
 
         async def worker():
@@ -55,7 +53,7 @@ async def run_level(url: str, key: str, concurrency: int, duration: float, strea
             while time.perf_counter() < deadline:
                 try:
                     latencies.append(await one(client, url, stream))
-                except (httpx.HTTPError, OSError):
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                     errors += 1
 
         started = time.perf_counter()
