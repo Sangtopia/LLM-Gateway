@@ -362,6 +362,84 @@
     },
     {
       "id": 10,
+      "type": "timeseries",
+      "title": "Anthropic quota remaining (requests per minute)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "min by (model) (gateway_upstream_quota_remaining{kind=\"requests\"})",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Anthropic quota remaining (input tokens per minute)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 30,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "min by (model) (gateway_upstream_quota_remaining{kind=\"input-tokens\"})",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 12,
       "type": "stat",
       "title": "Time to first token p95 by model",
       "datasource": {
@@ -369,8 +447,8 @@
         "uid": "prometheus"
       },
       "gridPos": {
-        "x": 16,
-        "y": 24,
+        "x": 0,
+        "y": 38,
         "w": 8,
         "h": 6
       },

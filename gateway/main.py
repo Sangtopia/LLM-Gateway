@@ -20,6 +20,7 @@ from gateway.responsecache import ResponseCache
 from gateway.semanticcache import Embedder, SemanticCache
 from gateway.retry import RetryPolicy
 from gateway.routing import LatencyTracker, Router
+from gateway.upstreamlimits import UpstreamLimits
 
 
 @asynccontextmanager
@@ -42,6 +43,7 @@ async def lifespan(app: FastAPI):
     app.state.refusal_fallbacks = settings.refusal_fallbacks
     app.state.breaker = CircuitBreaker(settings.circuit_failure_threshold, settings.circuit_cooldown_s)
     app.state.router = Router(settings.route_aliases, LatencyTracker())
+    app.state.upstream_limits = UpstreamLimits()
     engine = create_async_engine(settings.database_url)
     await init_db(engine)
     app.state.engine = engine
@@ -87,9 +89,10 @@ async def health() -> dict:
         "upstream_key_configured": bool(settings.anthropic_api_key),
         "circuits": app.state.breaker.snapshot(),  # Models currently skipped or probing.
         "ttft_p50_ms": app.state.router.latency.snapshot(),  # Used by the "fastest" strategy.
+        "upstream_quota": app.state.upstream_limits.snapshot(),  # Estimated from Anthropic's rate-limit headers.
     }
 
 
 @app.get("/metrics")
 async def prometheus_metrics() -> Response:
-    return Response(metrics.render(app.state.breaker), media_type="text/plain; version=0.0.4")
+    return Response(metrics.render(app.state.breaker, app.state.upstream_limits), media_type="text/plain; version=0.0.4")

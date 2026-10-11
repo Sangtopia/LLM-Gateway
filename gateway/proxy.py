@@ -19,8 +19,9 @@ from gateway.responsecache import ResponseCache, cache_key, cache_mode, cache_tt
 from gateway.semanticcache import SemanticCache, semantic_scope, semantic_threshold
 from gateway.ratelimit import RateLimiter, tokens_for_rate_limit
 from gateway.retry import Attempt, RetryPolicy, send_with_retries, should_retry
-from gateway.routing import Router
+from gateway.routing import CHARS_PER_TOKEN, Router
 from gateway.sse import StreamTracker
+from gateway.upstreamlimits import UpstreamLimits
 
 router = APIRouter()
 
@@ -139,6 +140,7 @@ class UpstreamCall:
     chain: list[str | None]
     policy: RetryPolicy
     breaker: CircuitBreaker
+    limits: UpstreamLimits | None = None  # Anthropic's rate-limit headers, for pacing.
     attempts: list[Attempt] = field(default_factory=list)
 
     def _sender(self, target: str | None):
@@ -146,23 +148,37 @@ class UpstreamCall:
 
         async def send() -> httpx.Response:
             req = self.http.build_request("POST", "/v1/messages", content=target_body, headers=self.headers, timeout=self.timeout)
-            return await self.http.send(req, stream=self.stream)
+            response = await self.http.send(req, stream=self.stream)
+            if self.limits is not None:
+                self.limits.observe(target, response.status_code, response.headers)
+            return response
 
         return send
 
     async def open(self, skip: frozenset[str | None] = frozenset()) -> Upstream:
         """Try each model in the chain (with retries) until one answers.
 
-        Skips models whose circuit is open, and models in `skip` (ones whose
-        stream just failed) unless that would leave nothing to try. Falls back
-        only on 429/529/5xx or unreachable models; any other error is the
-        request's fault and is returned.
+        Skips models whose circuit is open, models in `skip` (ones whose stream
+        just failed) unless that would leave nothing to try, and models whose
+        Anthropic rate limit is nearly used up unless every usable model is.
+        Falls back only on 429/529/5xx or unreachable models; any other error is
+        the request's fault and is returned.
         """
         chain = [m for m in self.chain if m not in skip] or self.chain
+        paced: dict[str | None, str] = {}
+        if self.limits is not None:
+            estimated_input = len(self.body) // CHARS_PER_TOKEN
+            usable = [m for m in chain if not m or self.breaker.state(m) != "open"]
+            paced = {m: why for m in usable if (why := self.limits.paced(m, estimated_input))}
+            if len(paced) == len(usable):
+                paced = {}  # Everything is near its limit: send anyway and let Anthropic decide.
         first_failure: httpx.Response | None = None  # The requested model's error, if it failed.
         last_failure: httpx.Response | None = None
         tried_any = False
         for position, target in enumerate(chain):
+            if target in paced:
+                self.attempts.append(Attempt(model=target, error=f"paced:{paced[target]}"))
+                continue
             if target and not self.breaker.allow(target):
                 self.attempts.append(Attempt(model=target, error="circuit_open"))
                 continue
@@ -321,6 +337,7 @@ async def messages(request: Request) -> Response:
         chain=chain,
         policy=request.app.state.retry_policy,
         breaker=request.app.state.breaker,
+        limits=request.app.state.upstream_limits,
     )
     record["attempts"] = call.attempts
 

@@ -98,6 +98,7 @@ flowchart LR
   - It opens after 5 failed tries in a row and skips that model.
   - After 30 s, one test request goes through. If it fails, the wait doubles, up to 5 minutes.
   - If every model in the chain is open, the gateway returns 503 immediately.
+- **Pacing from Anthropic's rate-limit headers:** every response reports the quota left on that model (`anthropic-ratelimit-*`). The gateway tracks it per model, estimating the continuous refill between responses. A model that's nearly out of requests, can't fit this request's estimated input, or recently returned a 429 is skipped for the next model in the chain, so the request avoids the 429 instead of retrying after it. If every model is near its limit, the request goes anyway. Remaining quota shows in `/health`, `/metrics` and Grafana.
 - **Refusal fallback:** Claude Haiku 5.5 has no server-side refusal fallback, so the gateway retries Haiku refusals on Sonnet 5.5.
 - **Streams that fail partway through:**
   - The opening events are held back until the first text arrives. If the stream fails before then, the gateway restarts it on the next model and the app never notices.

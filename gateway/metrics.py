@@ -9,6 +9,7 @@ gateway key ids (a handful per deployment), never request ids or prompts.
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, generate_latest
 
 from gateway.circuit import CircuitBreaker
+from gateway.upstreamlimits import UpstreamLimits
 
 REGISTRY = CollectorRegistry()
 
@@ -65,6 +66,13 @@ CIRCUIT_OPEN = Gauge(
     registry=REGISTRY,
 )
 
+UPSTREAM_QUOTA = Gauge(
+    "gateway_upstream_quota_remaining",
+    "Estimated remaining Anthropic rate-limit quota, from response headers.",
+    ["model", "kind"],
+    registry=REGISTRY,
+)
+
 TOKEN_FIELDS = {
     "input_tokens": "input",
     "output_tokens": "output",
@@ -103,8 +111,11 @@ def observe(record: dict) -> None:
         ATTEMPTS.labels(model=attempt.get("model") or "none", result=result).inc()
 
 
-def render(breaker: CircuitBreaker) -> bytes:
-    """The /metrics page. Circuit state is read at scrape time."""
+def render(breaker: CircuitBreaker, limits: UpstreamLimits | None = None) -> bytes:
+    """The /metrics page. Circuit state and upstream quota are read at scrape time."""
+    for model, kinds in (limits.snapshot() if limits else {}).items():
+        for kind, remaining in kinds.items():
+            UPSTREAM_QUOTA.labels(model=model, kind=kind).set(remaining)
     open_now = breaker.snapshot()
     for labels in list(CIRCUIT_OPEN._metrics):  # Reset models whose circuits have closed.
         if labels[0] not in open_now:

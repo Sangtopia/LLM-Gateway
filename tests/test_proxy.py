@@ -13,6 +13,7 @@ from gateway.main import app
 from gateway.ratelimit import ALLOW, Decision
 from gateway.responsecache import ResponseCache
 from gateway.retry import RetryPolicy
+from gateway.upstreamlimits import UpstreamLimits
 from gateway.routing import DEFAULT_ALIASES, LatencyTracker, Router
 
 TEST_KEY = "gw-test-key"
@@ -61,6 +62,7 @@ def make_client(handler) -> tuple[TestClient, FakeRequestLog]:
     app.state.router = Router(DEFAULT_ALIASES, LatencyTracker())
     app.state.response_cache = ResponseCache(fakeredis.FakeAsyncRedis())
     app.state.semantic_cache = None
+    app.state.upstream_limits = UpstreamLimits()
     return TestClient(app, headers={"x-api-key": TEST_KEY}), app.state.request_log
 
 
@@ -889,3 +891,40 @@ def test_refusal_fallback_respects_opt_out():
     client, _ = make_client(handler)
     resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"}, headers={"x-gateway-fallback": "off"})
     assert resp.json()["stop_reason"] == "refusal" and calls == ["claude-haiku-5-5"]
+
+
+# --- Pacing from Anthropic's rate-limit headers ------------------------------------------
+
+
+def quota_headers(remaining_requests: int) -> dict:
+    return {"anthropic-ratelimit-requests-limit": "1000", "anthropic-ratelimit-requests-remaining": str(remaining_requests)}
+
+
+def test_model_near_its_rate_limit_is_skipped_for_the_next_one():
+    seen = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        model = json.loads(req.content)["model"]
+        seen.append(model)
+        remaining = 2 if model == "claude-sonnet-5-5" else 900  # Sonnet 5.5's bucket is nearly empty.
+        return httpx.Response(200, json={"model": model, "usage": USAGE}, headers=quota_headers(remaining))
+
+    client, log = make_client(handler)
+    first = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+    second = client.post("/v1/messages", json={"model": "claude-sonnet-5-5"})
+
+    assert first.headers["x-gateway-model"] == "claude-sonnet-5-5"  # Nothing known yet.
+    assert second.headers["x-gateway-model"] == "claude-sonnet-5"  # Skipped before getting a 429.
+    assert seen == ["claude-sonnet-5-5", "claude-sonnet-5"]
+    assert log.records[1]["attempts"][0] == {"model": "claude-sonnet-5-5", "error": "paced:requests", "ms": 0.0}
+
+
+def test_when_every_model_is_paced_the_request_is_sent_anyway():
+    def handler(req: httpx.Request) -> httpx.Response:
+        model = json.loads(req.content)["model"]
+        return httpx.Response(200, json={"model": model, "usage": USAGE}, headers=quota_headers(0))
+
+    client, _ = make_client(handler)
+    client.post("/v1/messages", json={"model": "claude-haiku-5-5"})  # No fallback chain for Haiku.
+    resp = client.post("/v1/messages", json={"model": "claude-haiku-5-5"})
+    assert resp.status_code == 200 and resp.headers["x-gateway-model"] == "claude-haiku-5-5"
